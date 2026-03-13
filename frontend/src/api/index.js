@@ -47,6 +47,24 @@ export const api = {
   patch(path, data) { return this.request('PATCH', path, data) },
   delete(path) { return this.request('DELETE', path) },
 
+  async getBlob(path) {
+    const headers = {}
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`
+    }
+    const res = await fetch(API_BASE + path, { method: 'GET', headers })
+    if (res.status === 401) {
+      this.clearToken()
+      window.location.href = '/login'
+      throw new Error('Unauthorized')
+    }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || 'Request failed')
+    }
+    return res.blob()
+  },
+
   // Auth
   login(username, password) {
     return this.post('/auth/login', { username, password }).then(data => {
@@ -130,6 +148,10 @@ export const api = {
     const query = new URLSearchParams(params).toString()
     return this.get('/export/annotations' + (query ? `?${query}` : ''))
   },
+  exportAllReports() {
+    const query = new URLSearchParams({ format: 'pdf' }).toString()
+    return this.getBlob('/reports/export/all' + (query ? `?${query}` : ''))
+  },
 
   // Doctor
   getDoctorReports(params = {}) {
@@ -144,5 +166,8 @@ export const api = {
   },
   submitAnnotation(reportId, data) {
     return this.post(`/doctor/reports/${reportId}/annotation/submit`, { data })
+  },
+  cancelAnnotation(reportId) {
+    return this.post(`/doctor/reports/${reportId}/annotation/cancel`, {})
   }
 }

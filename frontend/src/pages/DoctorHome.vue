@@ -28,30 +28,59 @@
 
       <div class="report-list-wrap">
         <div class="report-list-header">
-          <span>任务列表</span>
-          <span>{{ reportList.length }} 条</span>
+          <span>任务列表（{{ reportList.length }} 条）</span>
+          <el-popover placement="bottom-end" :width="320" trigger="click">
+            <template #reference>
+              <el-button size="small" text>自定义字段</el-button>
+            </template>
+            <div class="column-selector">
+              <div class="column-selector-head">
+                <span>选择展示列</span>
+                <el-button link type="primary" @click="resetColumns">重置默认</el-button>
+              </div>
+              <el-checkbox-group v-model="visibleColumnKeys">
+                <el-checkbox
+                  v-for="col in doctorTableColumns"
+                  :key="col.key"
+                  :label="col.key"
+                  :disabled="visibleColumnKeys.length === 1 && visibleColumnKeys.includes(col.key)"
+                >
+                  {{ col.label }}
+                </el-checkbox>
+              </el-checkbox-group>
+            </div>
+          </el-popover>
         </div>
-        <div class="report-table-header">
-          <span>状态</span>
-          <span>检查号 / 标号</span>
-        </div>
-        <div class="report-list" ref="reportListRef" @scroll="handleReportListScroll">
-          <div class="virtual-spacer" :style="{ height: `${virtualList.totalHeight}px` }">
-            <div class="virtual-content" :style="{ transform: `translateY(${virtualList.offsetY}px)` }">
-          <div
-            v-for="report in virtualList.items"
-            :key="report.id"
-            :class="['report-item', { active: currentReport?.id === report.id, done: isAnnotated(report.status) }]"
-            @click="openReport(report)"
+
+        <div class="table-frame">
+          <el-table
+            ref="doctorTableRef"
+            :data="reportList"
+            row-key="id"
+            border
+            stripe
+            highlight-current-row
+            height="100%"
+            @row-click="openReport"
           >
-            <span class="dot" :class="isAnnotated(report.status) ? 'done' : 'todo'" />
-            <div class="report-texts">
-              <div class="report-id">{{ report.ris_no || report.external_id || ('R' + report.id) }}</div>
-              <div class="report-sub">{{ getStatusText(report.status) }}</div>
-            </div>
-          </div>
-            </div>
-          </div>
+            <el-table-column label="序号" type="index" width="64" />
+            <el-table-column
+              v-for="col in visibleColumns"
+              :key="col.key"
+              :prop="col.prop"
+              :label="col.label"
+              :width="col.width"
+              :min-width="col.minWidth"
+              :show-overflow-tooltip="col.overflow !== false"
+            >
+              <template v-if="col.key === 'status'" #default="{ row }">
+                <el-tag :type="getStatusType(row.status)">{{ getStatusText(row.status) }}</el-tag>
+              </template>
+              <template v-else-if="col.key === 'imported_at'" #default="{ row }">
+                {{ formatTime(row.imported_at) }}
+              </template>
+            </el-table-column>
+          </el-table>
         </div>
       </div>
 
@@ -68,9 +97,10 @@
           <div class="report-meta">检查号：{{ currentReport?.ris_no || '-' }}</div>
         </div>
         <div class="middle-actions">
-          <el-button type="primary" @click="createManualCardFromSelection">标注选中文本</el-button>
-          <el-button @click="saveDraft" :loading="saving">暂存</el-button>
-          <el-button type="success" @click="submitReport" :loading="submitting">完成标注</el-button>
+          <el-button type="primary" @click="createManualCardFromSelection" :disabled="isReportAnnotated">标注选中文本</el-button>
+          <el-button @click="saveDraft" :loading="saving" :disabled="isReportAnnotated">暂存</el-button>
+          <el-button type="success" @click="submitReport" :loading="submitting" :disabled="isReportAnnotated">完成标注</el-button>
+          <el-button v-if="isReportAnnotated" type="danger" plain @click="cancelSubmittedAnnotation">取消标注</el-button>
         </div>
       </div>
 
@@ -105,10 +135,6 @@
           :key="card.id"
           :class="['error-card', { selected: selectedCardId === card.id }]"
           shadow="hover"
-          draggable="true"
-          @dragstart="onCardDragStart(idx)"
-          @dragover.prevent
-          @drop="onCardDrop(idx)"
         >
           <template #header>
             <div class="card-head">
@@ -116,7 +142,6 @@
                 <el-tag size="small" :type="card.kind === 'pre' ? 'warning' : 'primary'">
                   {{ card.kind === 'pre' ? '预标注' : '手动标注' }}
                 </el-tag>
-                <el-tag v-if="card.kind === 'pre' && card.state === 'saved'" size="small" type="danger">预标注错误</el-tag>
                 <span class="card-index">#{{ idx + 1 }}</span>
               </div>
               <div class="card-field">{{ fieldText(card.content_type) }}</div>
@@ -124,34 +149,33 @@
           </template>
 
           <div class="card-body">
-            <div class="row"><span class="label">错误文本：</span>{{ card.source || '-' }}</div>
-            <div class="row" v-if="showTarget(card)"><span class="label">纠正方向：</span>{{ card.target || '-' }}</div>
+            <div class="row"><span class="label">错误文本：</span>{{ card.source || '（缺失）' }}</div>
+            <div class="row" v-if="card.target"><span class="label">替换内容：</span>{{ card.target || '-' }}</div>
 
             <div v-if="isEditing(card)">
               <el-select v-model="card.error_type" placeholder="错误类型" style="width: 100%; margin-bottom: 8px" @change="applyDefaultSeverity(card)">
-                <el-option v-for="item in errorTypeOptions" :key="item" :label="item" :value="item" />
+                <el-option v-for="item in errorTypeOptions" :key="item.value" :label="item.label" :value="item.value" />
               </el-select>
-              <el-select v-model="card.severity" placeholder="错误级别" style="width: 100%; margin-bottom: 8px">
-                <el-option label="低" value="low" />
-                <el-option label="中" value="medium" />
-                <el-option label="高" value="high" />
-              </el-select>
+              <el-button-group class="severity-group">
+                <el-button :type="card.severity === 'low' ? 'success' : 'default'" @click="card.severity = 'low'">低风险</el-button>
+                <el-button :type="card.severity === 'medium' ? 'warning' : 'default'" @click="card.severity = 'medium'">中风险</el-button>
+                <el-button :type="card.severity === 'high' ? 'danger' : 'default'" @click="card.severity = 'high'">高风险</el-button>
+              </el-button-group>
               <el-input
-                v-if="showTarget(card)"
                 v-model="card.target"
-                placeholder="纠正后内容"
+                placeholder="替换后内容"
                 style="margin-bottom: 8px"
               />
               <el-input
                 v-model="card.alert_message"
                 type="textarea"
                 :rows="2"
-                placeholder="建议说明"
+                placeholder="建议说明（删除/仅提示必填）"
               />
             </div>
 
             <div v-else>
-              <div class="row"><span class="label">错误类型：</span>{{ card.error_type || '-' }}</div>
+              <div class="row"><span class="label">错误类型：</span>{{ errorTypeText(card.error_type) }}</div>
               <div class="row"><span class="label">错误级别：</span>{{ severityText(card.severity) }}</div>
               <div class="row"><span class="label">建议说明：</span>{{ card.alert_message || '-' }}</div>
             </div>
@@ -159,16 +183,17 @@
 
           <div class="card-actions">
             <template v-if="card.kind === 'pre'">
-              <el-button v-if="card.state === 'pending'" size="small" type="success" @click="confirmPreCard(card)">确认</el-button>
-              <el-button v-if="card.state === 'pending'" size="small" @click="editCard(card)">修改</el-button>
-              <el-button v-if="card.state === 'confirmed'" size="small" @click="editCard(card)">修改</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click="saveCard(card)">保存</el-button>
+              <el-button v-if="card.state === 'pending'" size="small" type="success" @click="confirmPreCard(card)" :disabled="isReportAnnotated">确认</el-button>
+              <el-button v-if="card.state === 'pending'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
+              <el-button v-if="card.state === 'confirmed'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
+              <el-button v-if="card.state === 'saved'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
+              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
               <el-button v-if="card.state === 'editing'" size="small" @click="cancelEdit(card)">取消</el-button>
             </template>
 
             <template v-else>
-              <el-button v-if="card.state !== 'editing'" size="small" @click="editCard(card)">修改</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click="saveCard(card)">保存</el-button>
+              <el-button v-if="card.state !== 'editing'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
+              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
               <el-button v-if="card.state === 'editing'" size="small" @click="removeManualCard(card)">取消</el-button>
             </template>
           </div>
@@ -179,33 +204,62 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
+
+const TASK_COLUMNS_STORAGE_KEY = 'doctor_task_visible_columns_v1'
 
 const activeFilter = ref('all')
 const reportQuery = ref('')
 const onlyMine = ref(true)
 const currentUser = ref(null)
 
+const doctorTableRef = ref(null)
 const reportList = ref([])
 const currentReport = ref(null)
 const cards = ref([])
 const selectedCardId = ref(null)
-const dragCardIndex = ref(-1)
-const reportListRef = ref(null)
-const reportListScrollTop = ref(0)
 
 const saving = ref(false)
 const submitting = ref(false)
 const progress = ref({ done: 0, total: 0 })
-const VIRTUAL_ROW_HEIGHT = 52
-const VIRTUAL_VIEWPORT_HEIGHT = 300
+
+const doctorTableColumns = [
+  { key: 'ris_no', label: '检查号(RIS_NO)', prop: 'ris_no', width: 150 },
+  { key: 'modality', label: '检查类型', prop: 'modality', width: 110 },
+  { key: 'patient_sex', label: '性别', prop: 'patient_sex', width: 70 },
+  { key: 'patient_age', label: '年龄', prop: 'patient_age', width: 80 },
+  { key: 'exam_item', label: '检查项目', prop: 'exam_item', minWidth: 220 },
+  { key: 'exam_mode', label: '检查模式', prop: 'exam_mode', width: 140 },
+  { key: 'status', label: '状态', prop: 'status', width: 120, overflow: false },
+  { key: 'imported_at', label: '导入时间', prop: 'imported_at', width: 180 }
+]
+
+const visibleColumnKeys = ref(doctorTableColumns.map((item) => item.key))
+
+const ERROR_TYPE_MAP = {
+  bodyParts: '部位错误',
+  examitems: '检查项目错误',
+  organectomys: '器官切除/缺如信息错误',
+  positions: '体位/位置错误',
+  sexs: '性别错误',
+  typo_modality: '检查类型错写',
+  typo_unit: '单位错写/错误',
+  typos: '错别字/拼写错误',
+  typoTerms: '术语错写/术语错误'
+}
 
 const errorTypeOptions = [
-  'sexs', 'typos', 'typoTerms',
-  'bodyParts', 'examitems', 'typo_modality',
-  'typo_unit', 'organectomys', 'positions'
+  { value: 'sexs', label: '性别错误' },
+  { value: 'typos', label: '错别字/拼写错误' },
+  { value: 'typoTerms', label: '术语错写/术语错误' },
+  { value: 'bodyParts', label: '部位错误' },
+  { value: 'examitems', label: '检查项目错误' },
+  { value: 'typo_modality', label: '检查类型错写' },
+  { value: 'typo_unit', label: '单位错写/错误' },
+  { value: 'organectomys', label: '器官切除/缺如信息错误' },
+  { value: 'positions', label: '体位/位置错误' }
 ]
 
 const reportHeaderTitle = computed(() => {
@@ -218,17 +272,16 @@ const progressPercent = computed(() => {
   return Math.round((progress.value.done / progress.value.total) * 100)
 })
 
-const virtualList = computed(() => {
-  const total = reportList.value.length
-  const start = Math.max(0, Math.floor(reportListScrollTop.value / VIRTUAL_ROW_HEIGHT) - 5)
-  const visibleCount = Math.ceil(VIRTUAL_VIEWPORT_HEIGHT / VIRTUAL_ROW_HEIGHT) + 10
-  const end = Math.min(total, start + visibleCount)
-  return {
-    items: reportList.value.slice(start, end),
-    totalHeight: total * VIRTUAL_ROW_HEIGHT,
-    offsetY: start * VIRTUAL_ROW_HEIGHT
-  }
+const isReportAnnotated = computed(() => isAnnotated(currentReport.value?.status))
+
+const visibleColumns = computed(() => {
+  const selected = new Set(visibleColumnKeys.value)
+  return doctorTableColumns.filter((col) => selected.has(col.key))
 })
+
+watch(visibleColumnKeys, (val) => {
+  localStorage.setItem(TASK_COLUMNS_STORAGE_KEY, JSON.stringify(val))
+}, { deep: true })
 
 const isAnnotated = (status) => ['SUBMITTED', 'DONE'].includes(status)
 
@@ -240,6 +293,24 @@ const getStatusText = (status) => {
     DONE: '已标注'
   }
   return map[status] || status
+}
+
+const getStatusType = (status) => {
+  if (status === 'SUBMITTED' || status === 'DONE') return 'success'
+  if (status === 'IN_PROGRESS') return 'warning'
+  return 'info'
+}
+
+const formatTime = (value) => {
+  if (!value) return '-'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return '-'
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+const resetColumns = () => {
+  visibleColumnKeys.value = doctorTableColumns.map((item) => item.key)
 }
 
 const fieldText = (field) => {
@@ -274,18 +345,102 @@ const severityText = (v) => {
   return map[v] || v || '-'
 }
 
-const showTarget = (card) => {
-  return card.alert_type === '0' || card.alert_type === '2'
+const errorTypeText = (type) => ERROR_TYPE_MAP[type] || type || '-'
+
+const normalizeAction = (action) => {
+  if (['replace', 'delete', 'prompt'].includes(action)) return action
+  return 'replace'
+}
+
+const hasPreReplacementByTargetAndMessage = (card) => {
+  const source = String(card.source || '').trim()
+  const target = String(card.target || '').trim()
+  const message = String(card.alert_message || '')
+
+  if (!target) return false
+  if (source && target === source) return false
+
+  const replaceHint = /替换|改为|应改为|修正为|更正为|应为|改成|改写/
+  const nonReplaceHint = /删除|删去|去掉|移除|仅作提示|仅做提示|提示|注意|建议|复查|随访/
+  if (replaceHint.test(message)) return true
+  if (nonReplaceHint.test(message)) return false
+  return true
+}
+
+const inferActionByCard = (card) => {
+  const alertType = String(card.alert_type ?? '').trim()
+  const source = String(card.source || '')
+  const target = String(card.target || '')
+  const messageRaw = String(card.alert_message || '')
+
+  if (card.kind === 'pre') {
+    if (alertType === '1') return 'delete'
+    if (alertType === '3') return 'prompt'
+    if (hasPreReplacementByTargetAndMessage(card)) return 'replace'
+    if (/删除|删去|去掉|移除/.test(`${source}${messageRaw}`)) return 'delete'
+    return 'prompt'
+  }
+
+  if (alertType === '1') return 'delete'
+  if (alertType === '3') return 'prompt'
+  if (target.trim()) return 'replace'
+
+  const combined = `${source}${messageRaw}`
+  if (/删除|删去|去掉|移除/.test(combined)) return 'delete'
+  if (/提示|注意|建议|复查|随访/.test(combined)) return 'prompt'
+  if (card.error_type === 'organectomys') return 'delete'
+
+  return 'replace'
+}
+
+const syncActionToAlertType = (card) => {
+  card.action = normalizeAction(card.action || inferActionByCard(card))
+  const map = { replace: '2', delete: '1', prompt: '3' }
+  card.alert_type = map[card.action]
+}
+
+const chooseActionOnConfirm = async (card) => {
+  if (String(card.target || '').trim()) {
+    card.action = 'replace'
+    syncActionToAlertType(card)
+    return true
+  }
+
+  if (!String(card.alert_message || '').trim()) {
+    ElMessage.warning('当替换内容为空时，请先填写建议说明，再确认处理方式')
+    return false
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      '替换内容为空，请确认处理方式',
+      '错误处理方式确认',
+      {
+        confirmButtonText: '删除内容并提示',
+        cancelButtonText: '仅作提示',
+        distinguishCancelAndClose: true,
+        closeOnClickModal: false,
+        closeOnPressEscape: false,
+        type: 'warning'
+      }
+    )
+    card.action = 'delete'
+    syncActionToAlertType(card)
+    return true
+  } catch (e) {
+    if (e === 'cancel') {
+      card.action = 'prompt'
+      syncActionToAlertType(card)
+      return true
+    }
+    return false
+  }
 }
 
 const isEditing = (card) => card.state === 'editing'
 
 const applyDefaultSeverity = (card) => {
   if (!card.severity) card.severity = riskByErrorType(card.error_type)
-}
-
-const handleReportListScroll = (event) => {
-  reportListScrollTop.value = event.target?.scrollTop || 0
 }
 
 const getReportTextByField = (field) => {
@@ -308,8 +463,12 @@ const resolveRange = (text, card) => {
   const source = card.source || ''
   const parsedStart = Number.parseInt(card.source_in_start, 10)
   const parsedEnd = Number.parseInt(card.source_in_end, 10)
-  const candidates = []
 
+  if ((Number.isInteger(parsedStart) && parsedStart < 0) || (Number.isInteger(parsedEnd) && parsedEnd < 0)) {
+    return { start: 0, end: 0, missing: true }
+  }
+
+  const candidates = []
   if (Number.isInteger(parsedStart) && Number.isInteger(parsedEnd)) {
     candidates.push([parsedStart, parsedEnd], [parsedStart - 1, parsedEnd - 1])
   }
@@ -321,20 +480,22 @@ const resolveRange = (text, card) => {
     const start = Math.max(0, rawStart)
     const end = Math.min(text.length, Math.max(start, rawEnd))
     if (!source || text.slice(start, end) === source) {
-      return { start, end }
+      return { start, end, missing: false }
     }
   }
 
   if (source) {
     const index = text.indexOf(source)
-    if (index >= 0) return { start: index, end: index + source.length }
+    if (index >= 0) return { start: index, end: index + source.length, missing: false }
   }
+
   return null
 }
 
 const buildHighlights = (field) => {
   const text = getReportTextByField(field)
   if (!text) return []
+
   const cardOrderMap = new Map()
   let order = 1
   for (const card of cards.value) {
@@ -357,36 +518,43 @@ const buildHighlights = (field) => {
         ...card,
         index: cardOrderMap.get(card.id) || 0,
         start: range.start,
-        end: range.end
+        end: range.end,
+        missing: !!range.missing
       }
     })
     .filter(Boolean)
 
-  // 高亮区间若发生重叠，会导致 HTML 二次替换时切断已有标签，出现乱码（如 <sp2an>）。
-  // 这里统一按原始文本坐标从左到右拼接：
-  // 1) 完全相同的区间合并为一组（用于同一信息源多个错误时显示多个角标）
-  // 2) 非完全相同但有重叠的区间跳过后者，避免破坏 HTML 结构
   const sorted = rawHighlights
-    .filter((h) => Number.isInteger(h.start) && Number.isInteger(h.end) && h.end > h.start)
     .sort((a, b) => (a.start - b.start) || (a.end - b.end) || (a.index - b.index))
 
   const grouped = []
   for (const h of sorted) {
     const last = grouped[grouped.length - 1]
     if (!last) {
-      grouped.push({ start: h.start, end: h.end, cards: [h] })
+      grouped.push({ start: h.start, end: h.end, cards: [h], missing: h.missing })
       continue
     }
+
     if (h.start === last.start && h.end === last.end) {
       last.cards.push(h)
+      last.missing = last.missing || h.missing
       continue
     }
-    if (h.start < last.end) {
+
+    if (h.start < last.end && !h.missing) {
       continue
     }
-    grouped.push({ start: h.start, end: h.end, cards: [h] })
+
+    grouped.push({ start: h.start, end: h.end, cards: [h], missing: h.missing })
   }
+
   return grouped
+}
+
+const renderBadges = (cardsInRange) => {
+  return cardsInRange
+    .map((card, idx) => `<span class="hl-mark" data-card-id="${card.id}" style="right:${-7 - idx * 14}px">${card.index}</span>`)
+    .join('')
 }
 
 const getHighlightedHtml = (field) => {
@@ -399,19 +567,35 @@ const getHighlightedHtml = (field) => {
   let cursor = 0
   const parts = []
   for (const h of highlights) {
-    parts.push(escapeHtml(text.slice(cursor, h.start)))
-    const primaryCard = h.cards[0]
-    const sourceText = text.slice(h.start, h.end) || primaryCard.source
-    const cls = h.cards.some((card) => card.kind === 'manual') ? 'hl-chip manual' : 'hl-chip pre'
-    const badge = h.cards
-      .map((card, idx) => `<span class="hl-mark" data-card-id="${card.id}" style="right:${-7 - idx * 14}px">${card.index}</span>`)
-      .join('')
-    const replacement = `<span class="${cls}" data-card-id="${primaryCard.id}" title="${escapeHtml(primaryCard.alert_message || '')}">${escapeHtml(sourceText)}${badge}</span>`
-    parts.push(replacement)
-    cursor = h.end
-  }
-  parts.push(escapeHtml(text.slice(cursor)))
+    const safeStart = Math.max(0, Math.min(text.length, h.start))
+    const safeEnd = Math.max(safeStart, Math.min(text.length, h.end))
 
+    if (safeStart >= cursor) {
+      parts.push(escapeHtml(text.slice(cursor, safeStart)))
+    }
+
+    const primaryCard = h.cards[0]
+    const badge = renderBadges(h.cards)
+
+    if (h.missing || safeStart === safeEnd) {
+      const missingText = primaryCard.source || '缺失文本'
+      const replacement = `<span class="hl-chip missing" data-card-id="${primaryCard.id}" title="${escapeHtml(primaryCard.alert_message || '')}">[缺失: ${escapeHtml(missingText)}]${badge}</span>`
+      parts.push(replacement)
+      cursor = safeStart
+      continue
+    }
+
+    const sourceText = text.slice(safeStart, safeEnd)
+    const action = normalizeAction(primaryCard.action)
+    const baseClass = h.cards.some((card) => card.kind === 'manual') ? 'hl-chip manual' : 'hl-chip pre'
+    const actionClass = action === 'delete' ? 'hl-delete' : action === 'prompt' ? 'hl-prompt' : 'hl-replace'
+    const promptIcon = action === 'prompt' ? '<span class="hl-prompt-icon">!</span>' : ''
+    const replacement = `<span class="${baseClass} ${actionClass}" data-card-id="${primaryCard.id}" title="${escapeHtml(primaryCard.alert_message || '')}">${escapeHtml(sourceText)}${promptIcon}${badge}</span>`
+    parts.push(replacement)
+    cursor = safeEnd
+  }
+
+  parts.push(escapeHtml(text.slice(cursor)))
   return parts.join('')
 }
 
@@ -435,7 +619,7 @@ const cardToErrorItem = (card) => {
     location: fieldText(card.content_type),
     evidence_text: card.source || '',
     description: card.alert_message || '',
-    suggestion: showTarget(card) ? (card.target || '') : '',
+    suggestion: card.action === 'replace' ? (card.target || '') : '',
     anchor: {
       content_type: normalizeContentType(card.content_type),
       source_in_start: card.source_in_start,
@@ -444,7 +628,8 @@ const cardToErrorItem = (card) => {
       source: card.source,
       target: card.target,
       kind: card.kind,
-      state: card.state
+      state: card.state,
+      action: card.action
     }
   }
 }
@@ -477,7 +662,6 @@ const loadReports = async () => {
 
   const res = await api.getDoctorReports(params)
   reportList.value = res.items
-  reportListScrollTop.value = 0
 
   await loadProgress()
 
@@ -517,13 +701,19 @@ const buildPreCards = (report) => {
         content_type: item.content_type || '',
         source: item.source || '',
         target: item.target || '',
-        alert_type: String(item.alert_type ?? '0'),
+        alert_type: String(item.alert_type ?? '2'),
         alert_message: item.alert_message || item.alert_msg || '',
         error_type: item.err_type || 'typos',
         severity: riskByErrorType(item.err_type || 'typos'),
         source_in_start: item.source_in_start,
-        source_in_end: item.source_in_end
+        source_in_end: item.source_in_end,
+        action: 'replace'
       }
+      card.action = inferActionByCard(card)
+      if (card.action !== 'replace') {
+        card.target = ''
+      }
+      syncActionToAlertType(card)
 
       const dedupKey = [
         normalizeContentType(card.content_type),
@@ -546,20 +736,29 @@ const buildManualCardsFromAnnotation = (report) => {
   const annotation = report.annotation?.data
   if (!annotation?.error_items?.length) return []
 
-  return annotation.error_items.map((item, idx) => ({
-    id: `manual-${report.id}-${idx}`,
-    kind: 'manual',
-    state: 'saved',
-    content_type: item.anchor?.content_type || item.location || 'description',
-    source: item.evidence_text || item.anchor?.source || '',
-    target: item.suggestion || item.anchor?.target || '',
-    alert_type: String(item.anchor?.alert_type ?? (item.suggestion ? '2' : '1')),
-    alert_message: item.description || '',
-    error_type: item.error_type || 'typos',
-    severity: item.severity || riskByErrorType(item.error_type || 'typos'),
-    source_in_start: item.anchor?.source_in_start,
-    source_in_end: item.anchor?.source_in_end
-  }))
+  return annotation.error_items.map((item, idx) => {
+    const card = {
+      id: `manual-${report.id}-${idx}`,
+      kind: 'manual',
+      state: 'saved',
+      content_type: item.anchor?.content_type || item.location || 'description',
+      source: item.evidence_text || item.anchor?.source || '',
+      target: item.suggestion || item.anchor?.target || '',
+      alert_type: String(item.anchor?.alert_type ?? '2'),
+      alert_message: item.description || '',
+      error_type: item.error_type || 'typos',
+      severity: item.severity || riskByErrorType(item.error_type || 'typos'),
+      source_in_start: item.anchor?.source_in_start,
+      source_in_end: item.anchor?.source_in_end,
+      action: normalizeAction(item.anchor?.action)
+    }
+
+    if (!['replace', 'delete', 'prompt'].includes(card.action)) {
+      card.action = inferActionByCard(card)
+    }
+    syncActionToAlertType(card)
+    return card
+  })
 }
 
 const dedupeCards = (items) => {
@@ -592,6 +791,9 @@ const openReport = async (report) => {
   const manualCards = buildManualCardsFromAnnotation(detail)
   cards.value = dedupeCards([...preCards, ...manualCards])
   selectedCardId.value = cards.value[0]?.id || null
+
+  await nextTick()
+  doctorTableRef.value?.setCurrentRow(report)
 }
 
 const editCard = (card) => {
@@ -600,10 +802,18 @@ const editCard = (card) => {
   selectedCardId.value = card.id
 }
 
-const saveCard = (card) => {
+const saveCard = async (card) => {
+  applyDefaultSeverity(card)
+  const ok = await chooseActionOnConfirm(card)
+  if (!ok) return
+
+  if (['delete', 'prompt'].includes(card.action) && !String(card.alert_message || '').trim()) {
+    ElMessage.warning('删除内容并提示/仅作提示时，建议说明不能为空')
+    return
+  }
+
   card.state = 'saved'
   card._backup = null
-  applyDefaultSeverity(card)
   ElMessage.success('卡片已保存')
 }
 
@@ -612,16 +822,19 @@ const cancelEdit = (card) => {
     Object.assign(card, card._backup)
   }
   card._backup = null
-  card.state = card.kind === 'pre' ? 'pending' : 'saved'
 }
 
 const removeManualCard = (card) => {
   cards.value = cards.value.filter((item) => item.id !== card.id)
 }
 
-const confirmPreCard = (card) => {
-  card.state = 'confirmed'
+const confirmPreCard = async (card) => {
   applyDefaultSeverity(card)
+  const ok = await chooseActionOnConfirm(card)
+  if (!ok) return
+  card.state = 'confirmed'
+  card._backup = null
+  ElMessage.success('已确认预标注处理方式')
 }
 
 const createManualCardFromSelection = () => {
@@ -631,14 +844,50 @@ const createManualCardFromSelection = () => {
   }
 
   const selection = window.getSelection()
-  const selectedText = selection?.toString()?.trim()
-  if (!selectedText) {
+  const selectedTextRaw = selection?.toString() || ''
+  if (!selectedTextRaw.trim()) {
     ElMessage.warning('请先在中间报告中选中要标注的文本')
     return
   }
+  const selectedText = selectedTextRaw
 
   const anchorEl = selection.anchorNode?.parentElement
-  const field = anchorEl?.closest('[data-field]')?.dataset?.field || 'description'
+  const fieldBlock = anchorEl?.closest('[data-field]')
+  const field = fieldBlock?.dataset?.field || 'description'
+  const contentEl = fieldBlock?.querySelector('.section-content') || null
+  const range = selection.rangeCount > 0 ? selection.getRangeAt(0) : null
+
+  const shouldSkipNode = (textNode) => {
+    const parent = textNode?.parentElement
+    if (!parent) return true
+    return !!parent.closest('.hl-mark, .hl-prompt-icon')
+  }
+
+  const computeOffsetByTextNode = (rootEl, targetNode, targetOffset) => {
+    if (!rootEl || !targetNode || targetNode.nodeType !== Node.TEXT_NODE) return null
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT)
+    let total = 0
+    while (walker.nextNode()) {
+      const node = walker.currentNode
+      if (shouldSkipNode(node)) continue
+      if (node === targetNode) {
+        return total + Math.min(targetOffset, node.textContent?.length || 0)
+      }
+      total += node.textContent?.length || 0
+    }
+    return null
+  }
+
+  let sourceInStart = null
+  let sourceInEnd = null
+  if (range && contentEl && contentEl.contains(range.startContainer) && contentEl.contains(range.endContainer)) {
+    const startOffset = computeOffsetByTextNode(contentEl, range.startContainer, range.startOffset)
+    const endOffset = computeOffsetByTextNode(contentEl, range.endContainer, range.endOffset)
+    if (Number.isInteger(startOffset) && Number.isInteger(endOffset) && endOffset > startOffset) {
+      sourceInStart = startOffset
+      sourceInEnd = endOffset
+    }
+  }
 
   const now = Date.now()
   const newCard = {
@@ -652,27 +901,17 @@ const createManualCardFromSelection = () => {
     alert_message: '',
     error_type: 'typos',
     severity: 'low',
-    source_in_start: null,
-    source_in_end: null
+    source_in_start: sourceInStart,
+    source_in_end: sourceInEnd,
+    action: 'replace'
   }
 
   cards.value.push(newCard)
   selectedCardId.value = newCard.id
 }
 
-const onCardDragStart = (index) => {
-  dragCardIndex.value = index
-}
-
-const onCardDrop = (targetIndex) => {
-  if (dragCardIndex.value < 0 || dragCardIndex.value === targetIndex) return
-  const moved = cards.value.splice(dragCardIndex.value, 1)[0]
-  cards.value.splice(targetIndex, 0, moved)
-  dragCardIndex.value = -1
-}
-
 const saveDraft = async () => {
-  if (!currentReport.value) return
+  if (!currentReport.value || isReportAnnotated.value) return
   saving.value = true
   try {
     await api.saveDraft(currentReport.value.id, buildPayload())
@@ -685,23 +924,41 @@ const saveDraft = async () => {
 }
 
 const submitReport = async () => {
-  if (!currentReport.value) return
+  if (!currentReport.value || isReportAnnotated.value) return
   submitting.value = true
   try {
     await api.submitAnnotation(currentReport.value.id, buildPayload())
     ElMessage.success('标注完成')
-    currentReport.value = null
-    cards.value = []
-    selectedCardId.value = null
-    if (activeFilter.value === 'unannotated') {
-      await loadReports()
-    } else {
-      await loadReports()
+    await loadReports()
+    const latest = reportList.value.find((item) => item.id === currentReport.value?.id)
+    if (latest) {
+      await openReport(latest)
     }
   } catch (e) {
     ElMessage.error(e.message)
   } finally {
     submitting.value = false
+  }
+}
+
+const cancelSubmittedAnnotation = async () => {
+  if (!currentReport.value || !isReportAnnotated.value) return
+  try {
+    await ElMessageBox.confirm(
+      '取消后将清空当前报告已提交标注，并回到待标注状态，是否继续？',
+      '取消标注确认',
+      {
+        confirmButtonText: '确认取消',
+        cancelButtonText: '返回',
+        type: 'warning'
+      }
+    )
+    await api.cancelAnnotation(currentReport.value.id)
+    ElMessage.success('已取消，您可以重新标注')
+    await openReport(currentReport.value)
+    await loadReports()
+  } catch (_e) {
+    // ignore
   }
 }
 
@@ -728,6 +985,14 @@ const handleOnlyMineChange = async (value) => {
 
 onMounted(async () => {
   try {
+    const storedColumns = localStorage.getItem(TASK_COLUMNS_STORAGE_KEY)
+    if (storedColumns) {
+      const parsed = JSON.parse(storedColumns)
+      const allowed = new Set(doctorTableColumns.map((item) => item.key))
+      const clean = Array.isArray(parsed) ? parsed.filter((key) => allowed.has(key)) : []
+      if (clean.length) visibleColumnKeys.value = clean
+    }
+
     currentUser.value = await api.getMe()
     await loadReports()
   } catch (e) {
@@ -739,7 +1004,7 @@ onMounted(async () => {
 <style scoped>
 .doctor-workbench {
   display: grid;
-  grid-template-columns: 300px 1fr 380px;
+  grid-template-columns: 360px 1fr 380px;
   gap: 12px;
   height: calc(100vh - 130px);
 }
@@ -779,83 +1044,32 @@ onMounted(async () => {
 .report-list-header {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   margin-bottom: 8px;
+  color: #374151;
+  font-size: 12px;
+}
+
+.column-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.column-selector-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
   color: #6b7280;
   font-size: 12px;
 }
 
-.report-table-header {
-  display: grid;
-  grid-template-columns: 56px 1fr;
-  padding: 6px 8px;
-  border-bottom: 1px solid #e5e7eb;
-  color: #6b7280;
-  font-size: 12px;
-}
-
-.report-list {
+.table-frame {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
-}
-
-.virtual-spacer {
-  position: relative;
-  width: 100%;
-}
-
-.virtual-content {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-}
-
-.report-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px;
-  height: 52px;
-  box-sizing: border-box;
+  border: 1px solid #e5e7eb;
   border-radius: 6px;
-  cursor: pointer;
-}
-
-.report-item:hover {
-  background: #f3f4f6;
-}
-
-.report-item.active {
-  background: #e0f2fe;
-}
-
-.report-item.done .report-id {
-  color: #16a34a;
-}
-
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-}
-
-.dot.done {
-  background: #22c55e;
-}
-
-.dot.todo {
-  background: #d1d5db;
-}
-
-.report-id {
-  font-weight: 600;
-  font-size: 13px;
-}
-
-.report-sub {
-  font-size: 12px;
-  color: #6b7280;
+  overflow: hidden;
 }
 
 .progress-wrap {
@@ -946,6 +1160,39 @@ onMounted(async () => {
   color: #1e40af;
 }
 
+.section-content :deep(.hl-chip.hl-delete) {
+  text-decoration: line-through;
+  text-decoration-thickness: 2px;
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.section-content :deep(.hl-chip.hl-prompt) {
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px dashed #ef4444;
+}
+
+.section-content :deep(.hl-chip.missing) {
+  background: #fff7ed;
+  color: #b45309;
+  border: 1px dashed #f59e0b;
+}
+
+.section-content :deep(.hl-prompt-icon) {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  line-height: 12px;
+  border-radius: 999px;
+  text-align: center;
+  margin-left: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  background: #f97316;
+}
+
 .section-content :deep(.hl-mark) {
   position: absolute;
   top: -7px;
@@ -979,7 +1226,7 @@ onMounted(async () => {
 .error-card {
   margin-bottom: 10px;
   border: 1px solid #e5e7eb;
-  cursor: grab;
+  cursor: default;
 }
 
 .error-card.selected {
@@ -1012,6 +1259,15 @@ onMounted(async () => {
   color: #6b7280;
 }
 
+.severity-group {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.severity-group :deep(.el-button) {
+  width: 33.33%;
+}
+
 .card-actions {
   margin-top: 8px;
   display: flex;
@@ -1020,12 +1276,14 @@ onMounted(async () => {
 
 @media (max-width: 1280px) {
   .doctor-workbench {
-    grid-template-columns: 280px 1fr;
+    grid-template-columns: 1fr;
+    height: auto;
   }
 
+  .left-panel,
+  .middle-panel,
   .right-panel {
-    grid-column: 1 / 3;
-    height: 300px;
+    min-height: 320px;
   }
 }
 </style>

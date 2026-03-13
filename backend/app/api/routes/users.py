@@ -5,7 +5,6 @@ from ...core.database import get_db
 from ...core.security import get_password_hash
 from ...models.user import User
 from ...models.report import Report
-from ...models.annotation import Annotation
 from ...models.import_task import ImportTask
 from ...schemas.user import UserCreate, UserUpdate, UserListResponse
 from ..deps import get_current_user, require_role
@@ -19,7 +18,16 @@ def create_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    existing = db.query(User).filter(User.username == user_data.username).first()
+    if user_data.role == "reviewer":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="当前版本不支持创建复核人角色"
+        )
+
+    existing = db.query(User).filter(
+        User.username == user_data.username,
+        User.is_cancel == False
+    ).first()
     if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -31,6 +39,7 @@ def create_user(
         role=user_data.role,
         employee_id=user_data.employee_id,
         enabled=True,
+        is_cancel=False,
         can_view_all=False  # 新用户默认不能查看所有报告
     )
     db.add(user)
@@ -45,7 +54,7 @@ def list_users(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    query = db.query(User)
+    query = db.query(User).filter(User.is_cancel == False)
     if role:
         query = query.filter(User.role == role)
     return query.order_by(User.id.asc()).all()
@@ -57,7 +66,7 @@ def get_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(User.id == user_id, User.is_cancel == False).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
@@ -70,11 +79,18 @@ def update_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(User.id == user_id, User.is_cancel == False).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if user_data.username is not None:
         user.username = user_data.username
+    if user_data.role is not None:
+        if user_data.role == "reviewer":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="当前版本不支持复核人角色"
+            )
+        user.role = user_data.role
     if user_data.password is not None:
         user.password_hash = get_password_hash(user_data.password)
     if user_data.employee_id is not None:
@@ -113,7 +129,7 @@ def delete_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(User.id == user_id, User.is_cancel == False).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -134,10 +150,10 @@ def delete_user(
         {ImportTask.created_by: None},
         synchronize_session=False
     )
-    db.query(Annotation).filter(Annotation.doctor_id == user.id).delete(
-        synchronize_session=False
-    )
-
-    db.delete(user)
+    # 逻辑删除：保留用户和标注历史，仅标记取消
+    user.enabled = False
+    user.is_cancel = True
+    user.can_view_all = False
+    user.view_all_requested = False
     db.commit()
     return {"ok": True}

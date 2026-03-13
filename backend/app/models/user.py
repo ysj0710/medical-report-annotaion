@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
+from sqlalchemy import Column, Integer, String, DateTime, func, Boolean
 from ..core.database import Base
 
 
@@ -11,7 +11,8 @@ class User(Base):
     role = Column(String(32), nullable=False)  # admin/doctor/reviewer
     employee_id = Column(String(32), unique=True, index=True, nullable=True)  # 工号
     enabled = Column(Boolean, default=True)
-    can_view_all = Column(Boolean, default=False)  # 是否可以查看所有报告
-    view_all_requested = Column(Boolean, default=False)  # 是否申请了查看全部报告权限
+    is_cancel = Column(Boolean, default=False, index=True)  # False=未删除, True=已删除
+    can_view_all = Column(Boolean, default=False)
+    view_all_requested = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

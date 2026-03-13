@@ -36,10 +36,13 @@ def list_doctor_reports(
     # 根据 can_view_all 权限决定过滤条件
     if current_user.can_view_all and not only_mine:
         # 可以查看所有报告
-        query = db.query(Report)
+        query = db.query(Report).filter(Report.is_cancel == False)
     else:
         # 只能查看分配给自己的报告
-        query = db.query(Report).filter(Report.assigned_doctor_id == current_user.id)
+        query = db.query(Report).filter(
+            Report.assigned_doctor_id == current_user.id,
+            Report.is_cancel == False
+        )
 
     # 按 tab 筛选状态
     if tab == "unannotated":
@@ -77,8 +80,14 @@ def list_doctor_reports(
             external_id=report.external_id,
             ris_no=report.ris_no,
             report_text=report.report_text,
+            imported_at=report.imported_at,
             modality=report.modality,
+            patient_name=report.patient_name,
+            patient_sex=report.patient_sex,
+            patient_age=report.patient_age,
             exam_item=report.exam_item,
+            exam_mode=report.exam_mode,
+            exam_group=report.exam_group,
             description=report.description,
             impression=report.impression,
             status=report.status,
@@ -120,11 +129,12 @@ def get_doctor_report(
     """医生获取报告详情"""
     # 根据 can_view_all 权限决定过滤条件
     if current_user.can_view_all:
-        report = db.query(Report).filter(Report.id == report_id).first()
+        report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     else:
         report = db.query(Report).filter(
             Report.id == report_id,
-            Report.assigned_doctor_id == current_user.id
+            Report.assigned_doctor_id == current_user.id,
+            Report.is_cancel == False
         ).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -139,8 +149,14 @@ def get_doctor_report(
         external_id=report.external_id,
         ris_no=report.ris_no,
         report_text=report.report_text,
+        imported_at=report.imported_at,
         modality=report.modality,
+        patient_name=report.patient_name,
+        patient_sex=report.patient_sex,
+        patient_age=report.patient_age,
         exam_item=report.exam_item,
+        exam_mode=report.exam_mode,
+        exam_group=report.exam_group,
         description=report.description,
         impression=report.impression,
         status=report.status,
@@ -162,11 +178,12 @@ def save_draft(
     """保存草稿"""
     # 根据 can_view_all 权限决定过滤条件
     if current_user.can_view_all:
-        report = db.query(Report).filter(Report.id == report_id).first()
+        report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     else:
         report = db.query(Report).filter(
             Report.id == report_id,
-            Report.assigned_doctor_id == current_user.id
+            Report.assigned_doctor_id == current_user.id,
+            Report.is_cancel == False
         ).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -213,11 +230,12 @@ def submit_annotation(
     """提交标注"""
     # 根据 can_view_all 权限决定过滤条件
     if current_user.can_view_all:
-        report = db.query(Report).filter(Report.id == report_id).first()
+        report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     else:
         report = db.query(Report).filter(
             Report.id == report_id,
-            Report.assigned_doctor_id == current_user.id
+            Report.assigned_doctor_id == current_user.id,
+            Report.is_cancel == False
         ).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -252,6 +270,7 @@ def submit_annotation(
     next_report = db.query(Report).filter(
         Report.id != report_id,
         Report.assigned_doctor_id == current_user.id,
+        Report.is_cancel == False,
         Report.status.in_([STATUS_ASSIGNED, STATUS_IN_PROGRESS])
     ).first()
 
@@ -262,3 +281,35 @@ def submit_annotation(
         submitted_at=now,
         next_report_id=next_report.id if next_report else None
     )
+
+
+@router.post("/reports/{report_id}/annotation/cancel")
+def cancel_annotation(
+    report_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(["doctor"]))
+):
+    """取消已提交标注，回到待标注状态"""
+    if current_user.can_view_all:
+        report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
+    else:
+        report = db.query(Report).filter(
+            Report.id == report_id,
+            Report.assigned_doctor_id == current_user.id,
+            Report.is_cancel == False
+        ).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    annotation = db.query(Annotation).filter(
+        Annotation.report_id == report_id,
+        Annotation.doctor_id == current_user.id
+    ).first()
+
+    if annotation:
+        db.delete(annotation)
+
+    report.status = STATUS_ASSIGNED
+    report.submitted_at = None
+    db.commit()
+    return {"ok": True}

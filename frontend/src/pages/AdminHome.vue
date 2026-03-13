@@ -36,6 +36,9 @@
         >
           批量删除 ({{ selectedReports.length }})
         </el-button>
+        <el-button type="success" @click="handleExportAllReports">
+          批量导出标注PDF
+        </el-button>
       </div>
 
       <el-table
@@ -249,7 +252,7 @@
 
     <!-- 分发弹窗 -->
     <el-dialog v-model="showAssignModal" title="分发报告给医生" width="760px">
-      <p>将自动分发全部待分发报告（IMPORTED）</p>
+      <p>将自动分发全部可分配报告（待分发 + 未编辑的已分发）</p>
       <el-transfer
         v-model="assignDoctorIds"
         :data="doctorTransferData"
@@ -286,7 +289,6 @@
         <el-form-item label="角色">
           <el-select v-model="userForm.role" style="width: 100%">
             <el-option value="doctor" label="专家" />
-            <el-option value="reviewer" label="复核人" />
             <el-option value="admin" label="管理员" />
           </el-select>
         </el-form-item>
@@ -475,6 +477,10 @@ const handleAssign = async () => {
   try {
     const doctorMap = new Map(doctors.value.map((doctor) => [doctor.id, doctor.username]));
     const res = await api.assignReports([], null, assignDoctorIds.value);
+    if (!res.assigned) {
+      ElMessage.warning("没有可分配的报告（仅支持待分发/已分发状态）");
+      return;
+    }
     const perDoctorText = Object.entries(res.per_doctor || {})
       .filter(([, count]) => count > 0)
       .map(([doctorId, count]) => `${doctorMap.get(Number(doctorId)) || doctorId}：${count}条`)
@@ -493,9 +499,30 @@ const handleAssign = async () => {
   }
 };
 
-const viewReport = (r) => {
-  currentReport.value = r;
+const viewReport = async (r) => {
+  currentReport.value = await api.getReport(r.id);
   showReportDialog.value = true;
+};
+
+const handleExportAllReports = async () => {
+  try {
+    const blob = await api.exportAllReports();
+    const url = window.URL.createObjectURL(blob);
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const fileName = `annotated_reports_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.zip`;
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+    ElMessage.success("导出成功");
+  } catch (e) {
+    ElMessage.error(e.message || "导出失败");
+  }
 };
 
 const openUserModal = (user = null) => {
@@ -577,10 +604,15 @@ const deleteReport = async (r) => {
       { confirmButtonText: "确定", cancelButtonText: "取消", type: "warning" },
     );
     await api.deleteReport(r.id);
-    const idx = reports.value.indexOf(r);
-    if (idx > -1) reports.value.splice(idx, 1);
     selectedReports.value = selectedReports.value.filter((id) => id !== r.id);
-    reportTotal.value--;
+    const nextTotal = Math.max(0, reportTotal.value - 1);
+    const maxPage = Math.max(1, Math.ceil(nextTotal / reportPageSize.value));
+    reportTotal.value = nextTotal;
+    if (reportPage.value > maxPage) {
+      reportPage.value = maxPage;
+    } else {
+      await loadReports();
+    }
     ElMessage.success("删除成功");
   } catch (e) {
     if (e !== "cancel") ElMessage.error(e.message);
@@ -598,9 +630,15 @@ const batchDelete = async () => {
     for (const id of idsToDelete) {
       await api.deleteReport(id);
     }
-    reports.value = reports.value.filter((r) => !idsToDelete.includes(r.id));
     selectedReports.value = [];
-    reportTotal.value -= idsToDelete.length;
+    const nextTotal = Math.max(0, reportTotal.value - idsToDelete.length);
+    const maxPage = Math.max(1, Math.ceil(nextTotal / reportPageSize.value));
+    reportTotal.value = nextTotal;
+    if (reportPage.value > maxPage) {
+      reportPage.value = maxPage;
+    } else {
+      await loadReports();
+    }
     ElMessage.success("删除成功");
   } catch (e) {
     if (e !== "cancel") ElMessage.error(e.message);
@@ -648,8 +686,7 @@ const getStatusType = (status) => {
 const getRoleText = (role) => {
   const roleMap = {
     admin: "管理员",
-    doctor: "专家",
-    reviewer: "复核人"
+    doctor: "专家"
   };
   return roleMap[role] || role;
 };

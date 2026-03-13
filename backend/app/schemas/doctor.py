@@ -37,8 +37,14 @@ class DoctorReportResponse(BaseModel):
     external_id: Optional[str]
     ris_no: Optional[str] = None
     report_text: str
+    imported_at: Optional[datetime] = None
     modality: Optional[str] = None
+    patient_name: Optional[str] = None
+    patient_sex: Optional[str] = None
+    patient_age: Optional[str] = None
     exam_item: Optional[str] = None
+    exam_mode: Optional[str] = None
+    exam_group: Optional[str] = None
     description: Optional[str] = None
     impression: Optional[str] = None
     status: str

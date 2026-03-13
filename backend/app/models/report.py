@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 from ..core.database import Base
 
@@ -11,6 +11,7 @@ class Report(Base):
     ris_no = Column(String(128), index=True)  # 检查号
     report_text = Column(Text, nullable=False)  # 报告全文（DESCRIPTION + IMPRESSION）
     status = Column(String(32), default="IMPORTED", index=True)
+    is_cancel = Column(Boolean, default=False, index=True)  # False=未删除, True=已删除
 
     # 扩展字段
     modality = Column(String(64))  # 检查类型

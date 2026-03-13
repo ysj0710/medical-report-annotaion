@@ -32,6 +32,9 @@ class ReportResponse(BaseModel):
     # 医生信息（用于列表显示工号）
     doctor_employee_id: Optional[str] = None  # 医生工号
     doctor_username: Optional[str] = None  # 医生用户名
+    annotation_data: Optional[Any] = None
+    annotation_status: Optional[str] = None
+    annotation_submitted_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

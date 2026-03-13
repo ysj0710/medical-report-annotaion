@@ -3,10 +3,17 @@ import uuid
 import json
 from typing import Optional, List
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Response
 from sqlalchemy.orm import Session
+from sqlalchemy import or_, and_
 import pandas as pd
 from io import BytesIO
+import zipfile
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from ...core.database import get_db
 from ...models.user import User
 from ...models.report import Report
@@ -19,6 +26,7 @@ from ...schemas.report import (
 from ..deps import get_current_user, require_role
 
 router = APIRouter()
+pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
 
 # 报告状态
 STATUS_IMPORTED = "IMPORTED"
@@ -271,7 +279,10 @@ def import_reports(
                 # 检查RIS_NO是否已存在，存在则更新，不存在则新增
                 existing_report = None
                 if ris_no:
-                    existing_report = db.query(Report).filter(Report.ris_no == ris_no).first()
+                    existing_report = db.query(Report).filter(
+                        Report.ris_no == ris_no,
+                        Report.is_cancel == False
+                    ).first()
 
                 if existing_report:
                     # 更新已存在的报告
@@ -286,6 +297,7 @@ def import_reports(
                     existing_report.description = record.get("description")
                     existing_report.impression = record.get("impression")
                     existing_report.pre_annotations = pre_annotations if pre_annotations else None
+                    existing_report.is_cancel = False
                 else:
                     # 新增报告
                     report = Report(
@@ -293,6 +305,7 @@ def import_reports(
                         ris_no=ris_no,
                         report_text=record["report_text"],
                         status=STATUS_IMPORTED,
+                        is_cancel=False,
                         imported_by=current_user.id,
                         modality=record.get("modality"),
                         patient_sex=record.get("patient_sex"),
@@ -382,7 +395,7 @@ def list_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    query = db.query(Report)
+    query = db.query(Report).filter(Report.is_cancel == False)
 
     if status:
         query = query.filter(Report.status == status)
@@ -398,6 +411,7 @@ def list_reports(
     # 添加医生信息到返回结果
     result_items = []
     for item in items:
+        annotation = db.query(Annotation).filter(Annotation.report_id == item.id).first()
         item_dict = {
             'id': item.id,
             'external_id': item.external_id,
@@ -421,9 +435,12 @@ def list_reports(
             'pre_annotations': item.pre_annotations,
             'doctor_employee_id': None,
             'doctor_username': None,
+            'annotation_data': annotation.data if annotation else None,
+            'annotation_status': annotation.status if annotation else None,
+            'annotation_submitted_at': annotation.submitted_at if annotation else None,
         }
         if item.assigned_doctor_id:
-            doctor = db.query(User).filter(User.id == item.assigned_doctor_id).first()
+            doctor = db.query(User).filter(User.id == item.assigned_doctor_id, User.is_cancel == False).first()
             if doctor:
                 item_dict['doctor_employee_id'] = doctor.employee_id
                 item_dict['doctor_username'] = doctor.username
@@ -443,10 +460,41 @@ def get_report(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    report = db.query(Report).filter(Report.id == report_id).first()
+    report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    return report
+    doctor = None
+    if report.assigned_doctor_id:
+        doctor = db.query(User).filter(User.id == report.assigned_doctor_id, User.is_cancel == False).first()
+    annotation = db.query(Annotation).filter(Annotation.report_id == report.id).first()
+
+    return {
+        "id": report.id,
+        "external_id": report.external_id,
+        "ris_no": report.ris_no,
+        "report_text": report.report_text,
+        "status": report.status,
+        "imported_by": report.imported_by,
+        "imported_at": report.imported_at,
+        "assigned_doctor_id": report.assigned_doctor_id,
+        "assigned_at": report.assigned_at,
+        "submitted_at": report.submitted_at,
+        "modality": report.modality,
+        "patient_name": report.patient_name,
+        "patient_sex": report.patient_sex,
+        "patient_age": report.patient_age,
+        "exam_item": report.exam_item,
+        "exam_mode": report.exam_mode,
+        "exam_group": report.exam_group,
+        "description": report.description,
+        "impression": report.impression,
+        "pre_annotations": report.pre_annotations,
+        "doctor_employee_id": doctor.employee_id if doctor else None,
+        "doctor_username": doctor.username if doctor else None,
+        "annotation_data": annotation.data if annotation else None,
+        "annotation_status": annotation.status if annotation else None,
+        "annotation_submitted_at": annotation.submitted_at if annotation else None,
+    }
 
 
 @router.delete("/{report_id}")
@@ -456,12 +504,12 @@ def delete_report(
     current_user: User = Depends(require_role(["admin"]))
 ):
     """删除报告（仅允许删除 IMPORTED 状态的报告）"""
-    report = db.query(Report).filter(Report.id == report_id).first()
+    report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
     if report.status != "IMPORTED":
         raise HTTPException(status_code=400, detail="只能删除未分发的报告")
-    db.delete(report)
+    report.is_cancel = True
     db.commit()
     return {"ok": True}
 
@@ -472,7 +520,7 @@ def assign_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    """分发报告给医生（支持单医生、多医生自动均分、全量待分发）"""
+    """分发报告给医生（支持二次分配；有编辑/提交痕迹的报告禁止二次分配）"""
     selected_doctor_ids: List[int] = []
     if request.doctor_ids:
         selected_doctor_ids = [int(doctor_id) for doctor_id in request.doctor_ids]
@@ -488,15 +536,49 @@ def assign_reports(
     doctors = db.query(User).filter(
         User.id.in_(selected_doctor_ids),
         User.role == "doctor",
-        User.enabled == True
+        User.enabled == True,
+        User.is_cancel == False
     ).all()
     if len(doctors) != len(selected_doctor_ids):
         raise HTTPException(status_code=400, detail="医生不存在或已被禁用")
 
-    # 组装报告查询：未传 report_ids 时默认分发全部待分发报告
-    query = db.query(Report).filter(Report.status == STATUS_IMPORTED)
+    # 组装报告查询：
+    # 未传 report_ids 时默认分发全部可分配报告：
+    # 1) 待分发（IMPORTED）可分配
+    # 2) 已分发（ASSIGNED）仅在“无任何标注记录”时可二次分配
+    query = db.query(Report).outerjoin(
+        Annotation, Report.id == Annotation.report_id
+    ).filter(
+        Report.is_cancel == False,
+        or_(
+            Report.status == STATUS_IMPORTED,
+            and_(Report.status == STATUS_ASSIGNED, Annotation.id.is_(None))
+        )
+    )
     if request.report_ids:
-        query = query.filter(Report.id.in_(request.report_ids))
+        query = query.filter(
+            Report.id.in_(request.report_ids),
+            Report.status.in_([STATUS_IMPORTED, STATUS_ASSIGNED])
+        )
+
+        # 显式点选分发时，若包含已开始编辑/已提交的报告，直接阻断并提示
+        locked_reports = db.query(Report.id).join(
+            Annotation, Report.id == Annotation.report_id
+        ).filter(
+            Report.is_cancel == False,
+            Report.id.in_(request.report_ids),
+            Report.status == STATUS_ASSIGNED
+        ).all()
+        if locked_reports:
+            locked_ids = [str(item[0]) for item in locked_reports]
+            preview = "、".join(locked_ids[:20])
+            if len(locked_ids) > 20:
+                preview += "……"
+            raise HTTPException(
+                status_code=400,
+                detail=f"以下报告已开始编辑或已提交，不能二次分发：{preview}"
+            )
+
     reports = query.order_by(Report.id.asc()).all()
 
     if not reports:
@@ -532,7 +614,7 @@ def export_annotations(
         Annotation, Report.id == Annotation.report_id
     ).outerjoin(
         User, Report.assigned_doctor_id == User.id
-    ).filter(Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]))
+    ).filter(Report.is_cancel == False, Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]))
 
     if status:
         query = query.filter(Report.status == status)
@@ -559,6 +641,282 @@ def export_annotations(
         export_data.append(item)
 
     return export_data
+
+
+@router.get("/export/all")
+def export_all_reports(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(["admin"]))
+):
+    """批量导出报告 PDF（含标注修改内容），返回 ZIP"""
+    query = db.query(Report, Annotation, User).outerjoin(
+        Annotation, Report.id == Annotation.report_id
+    ).outerjoin(
+        User, Report.assigned_doctor_id == User.id
+    ).filter(Report.is_cancel == False).order_by(Report.id.asc())
+    results = query.all()
+
+    def norm_content_type(value: str) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in ["description", "desc", "检查所见"]:
+            return "description"
+        if raw in ["impression", "impress", "诊断意见"]:
+            return "impression"
+        return "description"
+
+    def norm_action(anchor: dict, suggestion: str) -> str:
+        action = str((anchor or {}).get("action") or "").strip()
+        if action in ["replace", "delete", "prompt"]:
+            return action
+        alert_type = str((anchor or {}).get("alert_type") or "").strip()
+        if alert_type == "1":
+            return "delete"
+        if alert_type == "3":
+            return "prompt"
+        return "replace" if str(suggestion or "").strip() else "prompt"
+
+    def build_display_items(report: Report, annotation: Optional[Annotation]) -> list:
+        """与查看页一致：优先医生标注，其次回退预标注。"""
+        annotation_data = annotation.data if annotation else {}
+        doctor_items = annotation_data.get("error_items", []) if annotation else []
+        if doctor_items:
+            return doctor_items
+
+        pre_items = []
+        for pre in (report.pre_annotations or []):
+            pre_items.append({
+                "error_type": pre.get("err_type") or "",
+                "severity": "",
+                "location": "检查所见" if norm_content_type(pre.get("content_type")) == "description" else "诊断意见",
+                "evidence_text": pre.get("source") or "",
+                "description": pre.get("alert_message") or pre.get("alert_msg") or "",
+                "suggestion": pre.get("target") or "",
+                "anchor": {
+                    "content_type": pre.get("content_type"),
+                    "source_in_start": pre.get("source_in_start"),
+                    "source_in_end": pre.get("source_in_end"),
+                    "alert_type": pre.get("alert_type"),
+                    "source": pre.get("source"),
+                    "target": pre.get("target"),
+                    "action": None,
+                }
+            })
+        return pre_items
+
+    def resolve_range(text: str, source: str, start_val, end_val):
+        start = int(start_val) if str(start_val or "").lstrip("-").isdigit() else None
+        end = int(end_val) if str(end_val or "").lstrip("-").isdigit() else None
+        if (start is not None and start < 0) or (end is not None and end < 0):
+            return 0, 0, True
+
+        candidates = []
+        if start is not None and end is not None:
+            candidates.extend([(start, end), (start - 1, end - 1)])
+        if start is not None and source:
+            slen = len(source)
+            candidates.extend([(start, start + slen), (start - 1, start - 1 + slen)])
+
+        for rs, re in candidates:
+            s = max(0, rs)
+            e = min(len(text), max(s, re))
+            if not source or text[s:e] == source:
+                return s, e, False
+
+        if source:
+            idx = text.find(source)
+            if idx >= 0:
+                return idx, idx + len(source), False
+        return None, None, False
+
+    def build_highlight_segments(text: str, items: list, field: str) -> list:
+        if not text:
+            return [{"text": "", "action": None}]
+        spans = []
+        for item in items:
+            anchor = item.get("anchor") or {}
+            item_field = norm_content_type(anchor.get("content_type") or item.get("location"))
+            if item_field != field:
+                continue
+            source = str(item.get("evidence_text") or anchor.get("source") or "")
+            s, e, missing = resolve_range(text, source, anchor.get("source_in_start"), anchor.get("source_in_end"))
+            if s is None:
+                continue
+            spans.append({
+                "start": s, "end": e, "missing": missing,
+                "action": norm_action(anchor, item.get("suggestion") or ""),
+                "source": source,
+                "suggestion": str(item.get("suggestion") or "")
+            })
+        spans.sort(key=lambda x: (x["start"], x["end"]))
+
+        filtered = []
+        missing_prefix = []
+        last_end = -1
+        for sp in spans:
+            if sp["missing"] or sp["start"] == sp["end"]:
+                missing_prefix.append({"text": f"【缺失:{sp['source']}】", "action": "prompt"})
+                continue
+            if sp["start"] < last_end:
+                continue
+            filtered.append(sp)
+            last_end = sp["end"]
+
+        segments = []
+        cursor = 0
+        for sp in filtered:
+            if sp["start"] > cursor:
+                segments.append({"text": text[cursor:sp["start"]], "action": None})
+            segments.append({"text": text[sp["start"]:sp["end"]], "action": sp["action"]})
+            cursor = sp["end"]
+        if cursor < len(text):
+            segments.append({"text": text[cursor:], "action": None})
+
+        return missing_prefix + (segments or [{"text": text, "action": None}])
+
+    def wrap_segments(segments: list, limit: int = 42) -> list:
+        lines = []
+        current_line = []
+        remaining = limit
+
+        for seg in segments:
+            text = str(seg.get("text") or "")
+            action = seg.get("action")
+            while text:
+                chunk = text[:remaining]
+                current_line.append({"text": chunk, "action": action})
+                text = text[remaining:]
+                remaining -= len(chunk)
+                if remaining == 0:
+                    lines.append(current_line)
+                    current_line = []
+                    remaining = limit
+
+        if current_line:
+            lines.append(current_line)
+        return lines or [[{"text": "", "action": None}]]
+
+    def write_lines(c: canvas.Canvas, y: float, lines: list):
+        for line in lines:
+            if y < 48:
+                c.showPage()
+                c.setFont("STSong-Light", 11)
+                y = A4[1] - 40
+            c.drawString(40, y, line)
+            y -= 16
+        return y
+
+    def draw_segment_line(c: canvas.Canvas, y: float, line_segments: list):
+        x = 40
+        font_name = "STSong-Light"
+        font_size = 11
+
+        for seg in line_segments:
+            text = str(seg.get("text") or "")
+            if not text:
+                continue
+            action = seg.get("action")
+            width = pdfmetrics.stringWidth(text, font_name, font_size)
+
+            if action == "replace":
+                # 替换：黄色底
+                c.setFillColor(colors.Color(1.0, 0.95, 0.75))
+                c.rect(x - 1, y - 3, width + 2, 14, fill=1, stroke=0)
+            elif action == "delete":
+                # 删除：深红底
+                c.setFillColor(colors.Color(0.98, 0.72, 0.72))
+                c.rect(x - 1, y - 3, width + 2, 14, fill=1, stroke=0)
+            elif action == "prompt":
+                # 仅提示：红色边框
+                c.setStrokeColor(colors.Color(0.90, 0.20, 0.20))
+                c.setLineWidth(1)
+                c.rect(x - 1, y - 3, width + 2, 14, fill=0, stroke=1)
+
+            c.setFillColor(colors.black)
+            c.drawString(x, y, text)
+
+            if action == "delete":
+                # 删除线
+                c.setStrokeColor(colors.Color(0.70, 0.05, 0.05))
+                c.setLineWidth(1.3)
+                c.line(x, y + 3.5, x + width, y + 3.5)
+
+            x += width
+
+    def write_segmented_paragraph(c: canvas.Canvas, y: float, title: str, segments: list):
+        y = write_lines(c, y, [title])
+        for line in wrap_segments(segments):
+            if y < 48:
+                c.showPage()
+                c.setFont("STSong-Light", 11)
+                y = A4[1] - 40
+            draw_segment_line(c, y, line)
+            y -= 16
+        return y
+
+    def build_report_pdf_bytes(report: Report, annotation: Optional[Annotation], doctor: Optional[User]) -> bytes:
+        buf = BytesIO()
+        c = canvas.Canvas(buf, pagesize=A4)
+        c.setFont("STSong-Light", 11)
+        y = A4[1] - 40
+
+        annotation_data = annotation.data if annotation else {}
+        error_items = build_display_items(report, annotation)
+        from_source = "医生标注" if annotation_data.get("error_items") else "预标注建议"
+
+        header = [
+            f"检查号: {report.ris_no or ''}    报告ID: {report.id}",
+            f"检查类型: {report.modality or ''}    检查项目: {report.exam_item or ''}",
+            f"标注医生: {doctor.username if doctor else ''}    状态: {report.status or ''}",
+            f"提交时间: {report.submitted_at.isoformat() if report.submitted_at else ''}",
+            f"修改来源: {from_source}",
+            "-" * 62,
+        ]
+        y = write_lines(c, y, header)
+
+        y = write_segmented_paragraph(
+            c, y, "【检查所见 - 标注后】", build_highlight_segments(report.description or "", error_items, "description")
+        )
+        y -= 6
+        y = write_segmented_paragraph(
+            c, y, "【诊断意见 - 标注后】", build_highlight_segments(report.impression or "", error_items, "impression")
+        )
+        y -= 6
+
+        y = write_lines(c, y, ["【修改标注明细】"])
+        if not error_items:
+            y = write_lines(c, y, ["无标注修改项"])
+        else:
+            for idx, item in enumerate(error_items, start=1):
+                anchor = item.get("anchor") or {}
+                action = norm_action(anchor, item.get("suggestion") or "")
+                action_text = {"replace": "替换内容", "delete": "删除内容并提示", "prompt": "仅作提示"}[action]
+                lines = [
+                    f"{idx}. 字段: {'检查所见' if norm_content_type(anchor.get('content_type')) == 'description' else '诊断意见'}",
+                    f"   错误文本: {item.get('evidence_text') or anchor.get('source') or ''}",
+                    f"   处理方式: {action_text}",
+                    f"   替换内容: {item.get('suggestion') or anchor.get('target') or ''}",
+                    f"   建议说明: {item.get('description') or ''}",
+                ]
+                y = write_lines(c, y, lines)
+
+        c.showPage()
+        c.save()
+        return buf.getvalue()
+
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        for report, annotation, doctor in results:
+            pdf_bytes = build_report_pdf_bytes(report, annotation, doctor)
+            safe_ris_no = (report.ris_no or report.external_id or str(report.id)).replace("/", "_").replace("\\", "_")
+            zipf.writestr(f"{safe_ris_no}.pdf", pdf_bytes)
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"annotated_reports_{timestamp}.zip"
+    return Response(
+        content=zip_buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 # 注册导出路由

@@ -58,7 +58,7 @@
 
       <!-- 底部信息 -->
       <div v-if="suggestionList.length" class="suggestion-section">
-        <h3 class="section-title">【预标注修改建议】</h3>
+        <h3 class="section-title">{{ report?.annotation_data ? '【医生标注结果】' : '【预标注修改建议】' }}</h3>
         <div v-for="(item, idx) in suggestionList" :key="idx" class="suggestion-item">
           <div>字段：{{ item.contentType }}</div>
           <div>错误类型：{{ item.errType }}</div>
@@ -157,10 +157,51 @@ const normalizeContentType = (contentType) => {
   return CONTENT_TYPE_MAP[lower] || CONTENT_TYPE_MAP[raw] || ''
 }
 
+const getDisplayAnnotations = () => {
+  const doctorItems = props.report?.annotation_data?.error_items || []
+  if (doctorItems.length > 0) {
+    return doctorItems.map((item) => {
+      const anchor = item.anchor || {}
+      return {
+        content_type: anchor.content_type || item.location || '',
+        err_type: item.error_type || '',
+        source: item.evidence_text || anchor.source || '',
+        target: item.suggestion || anchor.target || '',
+        alert_type: String(anchor.alert_type ?? (item.suggestion ? '2' : '3')),
+        alert_message: item.description || '',
+        alert_msg: item.description || '',
+        source_in_start: anchor.source_in_start,
+        source_in_end: anchor.source_in_end
+      }
+    })
+  }
+  return props.report?.pre_annotations || []
+}
+
+const inferActionByAnno = (anno) => {
+  const alertType = String(anno.alert_type ?? '').trim()
+  const source = String(anno.source || '')
+  const target = String(anno.target || '')
+  const message = String(anno.alert_message || anno.alert_msg || '')
+
+  if (alertType === '1') return 'delete'
+  if (alertType === '3') return 'prompt'
+  if (target.trim()) return 'replace'
+  if (/删除|删去|去掉|移除/.test(`${source}${message}`)) return 'delete'
+  if (/提示|注意|建议|复查|随访/.test(`${source}${message}`)) return 'prompt'
+  if (String(anno.err_type || '') === 'organectomys') return 'delete'
+  return 'replace'
+}
+
 const resolveHighlightRange = (text, anno) => {
   const source = String(anno.source || '')
   const parsedStart = Number.parseInt(anno.source_in_start, 10)
   const parsedEnd = Number.parseInt(anno.source_in_end, 10)
+
+  if ((Number.isInteger(parsedStart) && parsedStart < 0) || (Number.isInteger(parsedEnd) && parsedEnd < 0)) {
+    return { start: 0, end: 0, missing: true }
+  }
+
   const candidates = []
 
   if (Number.isInteger(parsedStart)) {
@@ -179,17 +220,17 @@ const resolveHighlightRange = (text, anno) => {
     const start = Math.max(0, rawStart)
     const end = Math.max(start, Math.min(text.length, rawEnd))
     if (!source) {
-      return { start, end }
+      return { start, end, missing: false }
     }
     if (text.slice(start, end) === source) {
-      return { start, end }
+      return { start, end, missing: false }
     }
   }
 
   if (source) {
     const fallbackIndex = text.indexOf(source)
     if (fallbackIndex !== -1) {
-      return { start: fallbackIndex, end: fallbackIndex + source.length }
+      return { start: fallbackIndex, end: fallbackIndex + source.length, missing: false }
     }
   }
   return null
@@ -199,7 +240,7 @@ const resolveHighlightRange = (text, anno) => {
 const getHighlightedText = (field) => {
   if (!props.report) return ''
 
-  const preAnnos = props.report.pre_annotations || []
+  const preAnnos = getDisplayAnnotations()
   if (preAnnos.length === 0) {
     // 没有预标注，直接返回原文
     return escapeHtml(props.report[field] || props.report.report_text || '无')
@@ -221,21 +262,30 @@ const getHighlightedText = (field) => {
 
   for (const item of matchedAnnos) {
     const anno = item.anno
-    const source = anno.source || ''
     const alertType = anno.alert_type || ''
     const alertMsg = anno.alert_message || anno.alert_msg || ''
     const errType = ERR_TYPE_MAP[anno.err_type] || anno.err_type || '错误'
-
-    if (!source) continue
-
     const start = item.start
     const end = item.end
+    const action = inferActionByAnno(anno)
+    const source = anno.source || ''
 
-    // 构建替换文本
-    const highlightClass = alertType === '1' ? 'error-highlight delete' : 'error-highlight'
-    const replaceHtml = `<span class="${highlightClass}" title="错误类型: ${errType}\n建议说明: ${escapeHtml(alertMsg)}">${escapeHtml(source)}</span>`
+    if (item.missing || start === end) {
+      const missingText = source || '缺失文本'
+      const replaceHtml = `<span class="error-highlight missing" title="错误类型: ${errType}\n建议说明: ${escapeHtml(alertMsg)}">[缺失: ${escapeHtml(missingText)}]<span class="error-corner">!</span></span>`
+      text = replaceHtml + text
+      continue
+    }
 
-    // 替换文本
+    const sourceText = text.substring(start, end)
+    const actionClass = action === 'delete' || alertType === '1'
+      ? 'delete'
+      : action === 'prompt'
+        ? 'prompt'
+        : 'replace'
+    const promptMark = actionClass === 'prompt' ? '<span class="error-corner">!</span>' : ''
+    const replaceHtml = `<span class="error-highlight ${actionClass}" title="错误类型: ${errType}\n建议说明: ${escapeHtml(alertMsg)}">${escapeHtml(sourceText)}${promptMark}</span>`
+
     if (start >= 0 && start < text.length) {
       text = text.substring(0, start) + replaceHtml + text.substring(end)
     }
@@ -245,7 +295,7 @@ const getHighlightedText = (field) => {
 }
 
 const suggestionList = computed(() => {
-  const preAnnos = props.report?.pre_annotations || []
+  const preAnnos = getDisplayAnnotations()
   return preAnnos.map((anno) => ({
     contentType: normalizeContentType(anno.content_type) === 'description'
       ? '检查所见'
@@ -406,11 +456,38 @@ const escapeHtml = (text) => {
   padding: 2px 4px;
   border-radius: 3px;
   font-weight: 500;
+  position: relative;
   cursor: help;
 }
 
 :deep(.error-highlight.delete) {
   background-color: #ff9999;
   text-decoration: line-through;
+}
+
+:deep(.error-highlight.prompt) {
+  background-color: #fee2e2;
+  color: #991b1b;
+  border: 1px dashed #ef4444;
+}
+
+:deep(.error-highlight.missing) {
+  background-color: #fff7ed;
+  color: #b45309;
+  border: 1px dashed #f59e0b;
+}
+
+:deep(.error-corner) {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 14px;
+  height: 14px;
+  line-height: 14px;
+  border-radius: 999px;
+  text-align: center;
+  color: #fff;
+  background: #ef4444;
+  font-size: 10px;
 }
 </style>

@@ -12,10 +12,11 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
+    role: Optional[str] = None
     employee_id: Optional[str] = None  # 工号
     enabled: Optional[bool] = None
-    can_view_all: Optional[bool] = None  # 是否可以查看所有报告
-    view_all_requested: Optional[bool] = None  # 是否已申请查看全部
+    can_view_all: Optional[bool] = None
+    view_all_requested: Optional[bool] = None
 
 
 class UserListResponse(BaseModel):
@@ -24,8 +25,8 @@ class UserListResponse(BaseModel):
     role: str
     employee_id: Optional[str] = None  # 工号
     enabled: bool
-    can_view_all: bool = False  # 是否可以查看所有报告
-    view_all_requested: bool = False  # 是否已申请查看全部
+    can_view_all: bool = False
+    view_all_requested: bool = False
 
     class Config:
         from_attributes = True
