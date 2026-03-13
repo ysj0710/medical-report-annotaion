@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source venv/bin/activate)",
+      "Bash(python -c \"from app.core.security import get_password_hash; print\\(get_password_hash\\(''admin123''\\)\\)\")",
+      "Bash(pip install:*)",
+      "Bash(curl -s -X POST http://localhost:8000/api/auth/login -H \"Content-Type: application/json\" -d '{\"\"username\"\": \"\"admin\"\", \"\"password\"\": \"\"admin123\"\"}')"
+    ]
+  }
+}
