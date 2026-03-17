@@ -123,7 +123,13 @@ export const api = {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}` },
       body: formData
-    }).then(res => res.json())
+    }).then(async (res) => {
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.detail || '导入失败')
+      }
+      return data
+    })
   },
   getImportTask(taskId) {
     return this.get(`/reports/import-tasks/${taskId}`)
@@ -149,8 +155,7 @@ export const api = {
     return this.get('/export/annotations' + (query ? `?${query}` : ''))
   },
   exportAllReports() {
-    const query = new URLSearchParams({ format: 'pdf' }).toString()
-    return this.getBlob('/reports/export/all' + (query ? `?${query}` : ''))
+    return this.getBlob('/reports/export/all')
   },
 
   // Doctor

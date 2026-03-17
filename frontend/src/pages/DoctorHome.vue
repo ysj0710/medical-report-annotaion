@@ -22,7 +22,7 @@
         </el-input>
       </div>
 
-      <div class="scope-row">
+      <div class="scope-row" v-if="!props.isAdminMode">
         <el-checkbox v-model="onlyMine" @change="handleOnlyMineChange">仅查看自己任务</el-checkbox>
       </div>
 
@@ -97,8 +97,9 @@
           <div class="report-meta">检查号：{{ currentReport?.ris_no || '-' }}</div>
         </div>
         <div class="middle-actions">
+          <el-button @click="goPrevReport">上一个</el-button>
+          <el-button @click="goNextReport">下一个</el-button>
           <el-button type="primary" @click="createManualCardFromSelection" :disabled="isReportAnnotated">标注选中文本</el-button>
-          <el-button @click="saveDraft" :loading="saving" :disabled="isReportAnnotated">暂存</el-button>
           <el-button type="success" @click="submitReport" :loading="submitting" :disabled="isReportAnnotated">完成标注</el-button>
           <el-button v-if="isReportAnnotated" type="danger" plain @click="cancelSubmittedAnnotation">取消标注</el-button>
         </div>
@@ -170,7 +171,7 @@
                 v-model="card.alert_message"
                 type="textarea"
                 :rows="2"
-                placeholder="建议说明（删除/仅提示必填）"
+                placeholder="建议说明"
               />
             </div>
 
@@ -185,7 +186,6 @@
             <template v-if="card.kind === 'pre'">
               <el-button v-if="card.state === 'pending'" size="small" type="success" @click="confirmPreCard(card)" :disabled="isReportAnnotated">确认</el-button>
               <el-button v-if="card.state === 'pending'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
-              <el-button v-if="card.state === 'confirmed'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
               <el-button v-if="card.state === 'saved'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
               <el-button v-if="card.state === 'editing'" size="small" type="primary" @click="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
               <el-button v-if="card.state === 'editing'" size="small" @click="cancelEdit(card)">取消</el-button>
@@ -208,6 +208,11 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
 
+const props = defineProps({
+  isAdminMode: { type: Boolean, default: false },
+  initialReportId: { type: Number, default: null }
+})
+
 const TASK_COLUMNS_STORAGE_KEY = 'doctor_task_visible_columns_v1'
 
 const activeFilter = ref('all')
@@ -221,8 +226,9 @@ const currentReport = ref(null)
 const cards = ref([])
 const selectedCardId = ref(null)
 
-const saving = ref(false)
 const submitting = ref(false)
+const autoSaving = ref(false)
+const autoSavePending = ref(false)
 const progress = ref({ done: 0, total: 0 })
 
 const doctorTableColumns = [
@@ -273,6 +279,10 @@ const progressPercent = computed(() => {
 })
 
 const isReportAnnotated = computed(() => isAnnotated(currentReport.value?.status))
+const currentReportIndex = computed(() => {
+  if (!currentReport.value) return -1
+  return reportList.value.findIndex((item) => item.id === currentReport.value.id)
+})
 
 const visibleColumns = computed(() => {
   const selected = new Set(visibleColumnKeys.value)
@@ -349,92 +359,40 @@ const errorTypeText = (type) => ERROR_TYPE_MAP[type] || type || '-'
 
 const normalizeAction = (action) => {
   if (['replace', 'delete', 'prompt'].includes(action)) return action
-  return 'replace'
-}
-
-const hasPreReplacementByTargetAndMessage = (card) => {
-  const source = String(card.source || '').trim()
-  const target = String(card.target || '').trim()
-  const message = String(card.alert_message || '')
-
-  if (!target) return false
-  if (source && target === source) return false
-
-  const replaceHint = /替换|改为|应改为|修正为|更正为|应为|改成|改写/
-  const nonReplaceHint = /删除|删去|去掉|移除|仅作提示|仅做提示|提示|注意|建议|复查|随访/
-  if (replaceHint.test(message)) return true
-  if (nonReplaceHint.test(message)) return false
-  return true
+  return 'prompt'
 }
 
 const inferActionByCard = (card) => {
   const alertType = String(card.alert_type ?? '').trim()
-  const source = String(card.source || '')
-  const target = String(card.target || '')
-  const messageRaw = String(card.alert_message || '')
-
-  if (card.kind === 'pre') {
-    if (alertType === '1') return 'delete'
-    if (alertType === '3') return 'prompt'
-    if (hasPreReplacementByTargetAndMessage(card)) return 'replace'
-    if (/删除|删去|去掉|移除/.test(`${source}${messageRaw}`)) return 'delete'
-    return 'prompt'
-  }
-
-  if (alertType === '1') return 'delete'
+  const source = String(card.source || '').trim()
+  const target = String(card.target || '').trim()
+  const messageRaw = String(card.alert_message || '').trim()
+  const promptHint = /不匹配|不符|请确认|需确认|建议核对|核对|矛盾|不一致|不相符|描述不符|与.+不符/
+  if (
+    /仅作提示|仅做提示/.test(messageRaw) ||
+    (
+      ['typo_modality', 'examitems'].includes(String(card.error_type || '')) &&
+      promptHint.test(messageRaw)
+    )
+  ) return 'prompt'
+  if (
+    card.error_type === 'typo_modality' ||
+    /不匹配|不符|请确认|需确认|建议核对|核对/.test(messageRaw)
+  ) return 'prompt'
   if (alertType === '3') return 'prompt'
-  if (target.trim()) return 'replace'
-
-  const combined = `${source}${messageRaw}`
-  if (/删除|删去|去掉|移除/.test(combined)) return 'delete'
-  if (/提示|注意|建议|复查|随访/.test(combined)) return 'prompt'
+  if (target && target !== source) return 'replace'
+  if (alertType === '2') return 'replace'
+  if (/删除|删去|去掉|移除|多余|不应存在|应删除/.test(`${source}${messageRaw}`)) return 'delete'
+  if (alertType === '1') return 'delete'
+  if (/不匹配|提示|注意|建议|复查|随访|核对|检查类型/.test(messageRaw)) return 'prompt'
   if (card.error_type === 'organectomys') return 'delete'
-
-  return 'replace'
+  return 'prompt'
 }
 
 const syncActionToAlertType = (card) => {
   card.action = normalizeAction(card.action || inferActionByCard(card))
   const map = { replace: '2', delete: '1', prompt: '3' }
   card.alert_type = map[card.action]
-}
-
-const chooseActionOnConfirm = async (card) => {
-  if (String(card.target || '').trim()) {
-    card.action = 'replace'
-    syncActionToAlertType(card)
-    return true
-  }
-
-  if (!String(card.alert_message || '').trim()) {
-    ElMessage.warning('当替换内容为空时，请先填写建议说明，再确认处理方式')
-    return false
-  }
-
-  try {
-    await ElMessageBox.confirm(
-      '替换内容为空，请确认处理方式',
-      '错误处理方式确认',
-      {
-        confirmButtonText: '删除内容并提示',
-        cancelButtonText: '仅作提示',
-        distinguishCancelAndClose: true,
-        closeOnClickModal: false,
-        closeOnPressEscape: false,
-        type: 'warning'
-      }
-    )
-    card.action = 'delete'
-    syncActionToAlertType(card)
-    return true
-  } catch (e) {
-    if (e === 'cancel') {
-      card.action = 'prompt'
-      syncActionToAlertType(card)
-      return true
-    }
-    return false
-  }
 }
 
 const isEditing = (card) => card.state === 'editing'
@@ -589,7 +547,7 @@ const getHighlightedHtml = (field) => {
     const action = normalizeAction(primaryCard.action)
     const baseClass = h.cards.some((card) => card.kind === 'manual') ? 'hl-chip manual' : 'hl-chip pre'
     const actionClass = action === 'delete' ? 'hl-delete' : action === 'prompt' ? 'hl-prompt' : 'hl-replace'
-    const promptIcon = action === 'prompt' ? '<span class="hl-prompt-icon">!</span>' : ''
+    const promptIcon = action === 'prompt' ? '<span class="hl-prompt-triangle">!</span>' : ''
     const replacement = `<span class="${baseClass} ${actionClass}" data-card-id="${primaryCard.id}" title="${escapeHtml(primaryCard.alert_message || '')}">${escapeHtml(sourceText)}${promptIcon}${badge}</span>`
     parts.push(replacement)
     cursor = safeEnd
@@ -636,7 +594,7 @@ const cardToErrorItem = (card) => {
 
 const buildPayload = () => {
   const validCards = cards.value.filter((card) => {
-    if (card.kind === 'pre') return ['confirmed', 'saved'].includes(card.state)
+    if (card.kind === 'pre') return card.state === 'saved'
     return card.state === 'saved'
   })
 
@@ -657,7 +615,12 @@ const loadProgress = async () => {
 }
 
 const loadReports = async () => {
-  const params = { tab: activeFilter.value, page: 1, page_size: 1000, only_mine: onlyMine.value }
+  const params = {
+    tab: activeFilter.value,
+    page: 1,
+    page_size: 1000,
+    only_mine: props.isAdminMode ? false : onlyMine.value
+  }
   if (reportQuery.value) params.q = reportQuery.value
 
   const res = await api.getDoctorReports(params)
@@ -666,7 +629,10 @@ const loadReports = async () => {
   await loadProgress()
 
   if (!currentReport.value && reportList.value.length > 0) {
-    await openReport(reportList.value[0])
+    const preferred = props.initialReportId
+      ? reportList.value.find((item) => item.id === props.initialReportId)
+      : null
+    await openReport(preferred || reportList.value[0])
     return
   }
 
@@ -796,6 +762,37 @@ const openReport = async (report) => {
   doctorTableRef.value?.setCurrentRow(report)
 }
 
+const updateCurrentReportStatusLocally = (status) => {
+  if (!currentReport.value) return
+  currentReport.value.status = status
+  const row = reportList.value.find((item) => item.id === currentReport.value.id)
+  if (row) row.status = status
+}
+
+const autoSaveAfterInteraction = async () => {
+  if (!currentReport.value || isReportAnnotated.value) return
+  if (autoSaving.value) {
+    autoSavePending.value = true
+    return
+  }
+  autoSaving.value = true
+  try {
+    await api.saveDraft(currentReport.value.id, buildPayload())
+    if (currentReport.value.status === 'ASSIGNED') {
+      updateCurrentReportStatusLocally('IN_PROGRESS')
+    }
+    await loadProgress()
+  } catch (e) {
+    ElMessage.error(e.message || '自动暂存失败')
+  } finally {
+    autoSaving.value = false
+    if (autoSavePending.value) {
+      autoSavePending.value = false
+      await autoSaveAfterInteraction()
+    }
+  }
+}
+
 const editCard = (card) => {
   card._backup = { ...card }
   card.state = 'editing'
@@ -804,17 +801,16 @@ const editCard = (card) => {
 
 const saveCard = async (card) => {
   applyDefaultSeverity(card)
-  const ok = await chooseActionOnConfirm(card)
-  if (!ok) return
-
-  if (['delete', 'prompt'].includes(card.action) && !String(card.alert_message || '').trim()) {
-    ElMessage.warning('删除内容并提示/仅作提示时，建议说明不能为空')
-    return
+  syncActionToAlertType(card)
+  if (card.action !== 'replace') {
+    card.target = ''
   }
-
+  if (card.kind === 'pre') {
+    card.kind = 'manual'
+  }
   card.state = 'saved'
   card._backup = null
-  ElMessage.success('卡片已保存')
+  await autoSaveAfterInteraction()
 }
 
 const cancelEdit = (card) => {
@@ -826,15 +822,19 @@ const cancelEdit = (card) => {
 
 const removeManualCard = (card) => {
   cards.value = cards.value.filter((item) => item.id !== card.id)
+  autoSaveAfterInteraction()
 }
 
 const confirmPreCard = async (card) => {
   applyDefaultSeverity(card)
-  const ok = await chooseActionOnConfirm(card)
-  if (!ok) return
-  card.state = 'confirmed'
+  syncActionToAlertType(card)
+  if (card.action !== 'replace') {
+    card.target = ''
+  }
+  card.kind = 'manual'
+  card.state = 'saved'
   card._backup = null
-  ElMessage.success('已确认预标注处理方式')
+  await autoSaveAfterInteraction()
 }
 
 const createManualCardFromSelection = () => {
@@ -910,18 +910,71 @@ const createManualCardFromSelection = () => {
   selectedCardId.value = newCard.id
 }
 
-const saveDraft = async () => {
-  if (!currentReport.value || isReportAnnotated.value) return
-  saving.value = true
+const remindUnsubmitted = async () => {
+  if (!currentReport.value || isReportAnnotated.value) return 'pass'
   try {
-    await api.saveDraft(currentReport.value.id, buildPayload())
-    ElMessage.success('草稿已保存')
+    await ElMessageBox.confirm(
+      '该报告已暂存，暂未确认标注完成。你可以立即确认完成标注，或继续查看下一份报告。',
+      '切换提示',
+      {
+        confirmButtonText: '立即确认完成标注',
+        cancelButtonText: '仍要查看下一份报告',
+        distinguishCancelAndClose: true,
+        closeOnClickModal: false,
+        closeOnPressEscape: true,
+        type: 'warning'
+      }
+    )
+    return 'submit'
   } catch (e) {
-    ElMessage.error(e.message)
-  } finally {
-    saving.value = false
+    if (e === 'cancel') return 'pass'
+    return 'abort'
   }
 }
+
+const switchReportByOffset = async (offset) => {
+  if (!reportList.value.length) return
+  const intent = await remindUnsubmitted()
+  if (intent === 'abort') return
+  const previousReportId = currentReport.value?.id
+  const currentIdx = currentReportIndex.value
+  const total = reportList.value.length
+  const baseIdx = currentIdx < 0 ? 0 : currentIdx
+  const targetIdx = (baseIdx + offset + total) % total
+  const fallbackTargetId = reportList.value[targetIdx]?.id
+
+  if (intent === 'submit' && currentReport.value && !isReportAnnotated.value) {
+    try {
+      await api.submitAnnotation(currentReport.value.id, buildPayload())
+      updateCurrentReportStatusLocally('SUBMITTED')
+      await loadReports()
+    } catch (e) {
+      ElMessage.error(e.message || '完成标注失败，未切换报告')
+      return
+    }
+  }
+
+  let nextReport = null
+  if (intent === 'submit' && previousReportId) {
+    const newIndex = reportList.value.findIndex((item) => item.id === previousReportId)
+    if (newIndex >= 0) {
+      const adjustedIdx = (newIndex + offset + reportList.value.length) % reportList.value.length
+      nextReport = reportList.value[adjustedIdx]
+    }
+  }
+  if (!nextReport && fallbackTargetId) {
+    nextReport = reportList.value.find((item) => item.id === fallbackTargetId) || null
+  }
+  if (!nextReport && reportList.value.length) {
+    nextReport = reportList.value[0]
+  }
+  if (nextReport) {
+    await openReport(nextReport)
+  }
+}
+
+const goPrevReport = async () => switchReportByOffset(-1)
+const goNextReport = async () => switchReportByOffset(1)
 
 const submitReport = async () => {
   if (!currentReport.value || isReportAnnotated.value) return
@@ -994,6 +1047,9 @@ onMounted(async () => {
     }
 
     currentUser.value = await api.getMe()
+    if (props.isAdminMode) {
+      onlyMine.value = false
+    }
     await loadReports()
   } catch (e) {
     ElMessage.error(e.message || '加载医生任务失败')
@@ -1169,8 +1225,9 @@ onMounted(async () => {
 
 .section-content :deep(.hl-chip.hl-prompt) {
   background: #fee2e2;
-  color: #991b1b;
-  border: 1px dashed #ef4444;
+  color: #b91c1c;
+  border: 1px solid #ef4444;
+  font-weight: 600;
 }
 
 .section-content :deep(.hl-chip.missing) {
@@ -1179,18 +1236,19 @@ onMounted(async () => {
   border: 1px dashed #f59e0b;
 }
 
-.section-content :deep(.hl-prompt-icon) {
-  display: inline-block;
-  width: 12px;
+.section-content :deep(.hl-prompt-triangle) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
   height: 12px;
-  line-height: 12px;
-  border-radius: 999px;
-  text-align: center;
-  margin-left: 3px;
-  font-size: 10px;
-  font-weight: 700;
+  margin-left: 4px;
+  font-size: 9px;
+  line-height: 1;
+  font-weight: 800;
   color: #fff;
-  background: #f97316;
+  background: #dc2626;
+  clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
 }
 
 .section-content :deep(.hl-mark) {
@@ -1274,16 +1332,4 @@ onMounted(async () => {
   gap: 8px;
 }
 
-@media (max-width: 1280px) {
-  .doctor-workbench {
-    grid-template-columns: 1fr;
-    height: auto;
-  }
-
-  .left-panel,
-  .middle-panel,
-  .right-panel {
-    min-height: 320px;
-  }
-}
 </style>

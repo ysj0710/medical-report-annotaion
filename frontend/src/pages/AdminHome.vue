@@ -37,7 +37,7 @@
           批量删除 ({{ selectedReports.length }})
         </el-button>
         <el-button type="success" @click="handleExportAllReports">
-          批量导出标注PDF
+          批量导出标注Excel
         </el-button>
       </div>
 
@@ -299,8 +299,17 @@
       </template>
     </el-dialog>
 
-    <!-- 报告查看弹窗 -->
-    <ReportViewDialog v-model="showReportDialog" :report="currentReport" />
+    <!-- 管理员标注工作台（医生端同款） -->
+    <el-dialog
+      v-model="showWorkbenchDialog"
+      title="报告标注工作台"
+      width="96%"
+      top="2vh"
+      destroy-on-close
+      class="workbench-dialog"
+    >
+      <DoctorHome :is-admin-mode="true" :initial-report-id="currentWorkbenchReportId || undefined" />
+    </el-dialog>
   </div>
 </template>
 
@@ -309,7 +318,7 @@ import { ref, watch, nextTick, computed } from "vue";
 import { useRoute } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api } from "../api";
-import ReportViewDialog from "../components/ReportViewDialog.vue";
+import DoctorHome from "./DoctorHome.vue";
 
 const route = useRoute();
 
@@ -343,8 +352,8 @@ const userForm = ref({ username: "", password: "", role: "doctor", employee_id: 
 
 // 分发
 const showAssignModal = ref(false);
-const showReportDialog = ref(false);
-const currentReport = ref(null);
+const showWorkbenchDialog = ref(false);
+const currentWorkbenchReportId = ref(null);
 const assignDoctorIds = ref([]);
 const doctorTransferData = computed(() =>
   doctors.value.map((doctor) => ({
@@ -443,6 +452,9 @@ const handleImport = async () => {
   try {
     const res = await api.importReports(importFile.value, preAnnotationFile.value);
     importTask.value = await pollTask(res.task_id);
+    if (importTask.value.status !== "SUCCESS") {
+      throw new Error(importTask.value.message || "导入失败");
+    }
     ElMessage.success("导入完成");
   } catch (e) {
     ElMessage.error(e.message);
@@ -500,8 +512,8 @@ const handleAssign = async () => {
 };
 
 const viewReport = async (r) => {
-  currentReport.value = await api.getReport(r.id);
-  showReportDialog.value = true;
+  currentWorkbenchReportId.value = r.id;
+  showWorkbenchDialog.value = true;
 };
 
 const handleExportAllReports = async () => {
@@ -510,7 +522,7 @@ const handleExportAllReports = async () => {
     const url = window.URL.createObjectURL(blob);
     const now = new Date();
     const pad = (n) => String(n).padStart(2, "0");
-    const fileName = `annotated_reports_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.zip`;
+    const fileName = `annotated_reports_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.xlsx`;
 
     const link = document.createElement("a");
     link.href = url;
@@ -759,5 +771,9 @@ watch(
 
 .import-result {
   margin-top: 20px;
+}
+
+.workbench-dialog :deep(.el-dialog__body) {
+  padding-top: 8px;
 }
 </style>

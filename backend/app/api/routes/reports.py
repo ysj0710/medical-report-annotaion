@@ -8,12 +8,6 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
 import pandas as pd
 from io import BytesIO
-import zipfile
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from ...core.database import get_db
 from ...models.user import User
 from ...models.report import Report
@@ -26,7 +20,6 @@ from ...schemas.report import (
 from ..deps import get_current_user, require_role
 
 router = APIRouter()
-pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
 
 # 报告状态
 STATUS_IMPORTED = "IMPORTED"
@@ -265,6 +258,20 @@ def import_reports(
 
         # 标准化列名
         records = normalize_columns(df)
+
+        # 原始报告与预标注文件的 RIS_NO 必须一致，避免错配导入
+        if pre_annotations_map:
+            report_ris_set = {normalize_identifier(item.get("ris_no")) for item in records if item.get("ris_no")}
+            pre_ris_set = {normalize_identifier(item) for item in pre_annotations_map.keys() if item}
+            missing_in_pre = sorted([ris for ris in report_ris_set - pre_ris_set if ris])
+            extra_in_pre = sorted([ris for ris in pre_ris_set - report_ris_set if ris])
+            if missing_in_pre or extra_in_pre:
+                hints = []
+                if missing_in_pre:
+                    hints.append(f"原始报告存在但预标注缺失: {', '.join(missing_in_pre[:10])}")
+                if extra_in_pre:
+                    hints.append(f"预标注存在但原始报告缺失: {', '.join(extra_in_pre[:10])}")
+                raise ValueError(f"上传的原始报告与预标注报告 RIS_NO 不匹配。{'；'.join(hints)}")
 
         task.total_rows = len(records)
         success_count = 0
@@ -648,7 +655,7 @@ def export_all_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    """批量导出报告 PDF（含标注修改内容），返回 ZIP"""
+    """批量导出报告与标注数据（Excel，与导入格式一致）"""
     query = db.query(Report, Annotation, User).outerjoin(
         Annotation, Report.id == Annotation.report_id
     ).outerjoin(
@@ -656,7 +663,7 @@ def export_all_reports(
     ).filter(Report.is_cancel == False).order_by(Report.id.asc())
     results = query.all()
 
-    def norm_content_type(value: str) -> str:
+    def normalize_content_type(value: str) -> str:
         raw = str(value or "").strip().lower()
         if raw in ["description", "desc", "检查所见"]:
             return "description"
@@ -664,257 +671,103 @@ def export_all_reports(
             return "impression"
         return "description"
 
-    def norm_action(anchor: dict, suggestion: str) -> str:
-        action = str((anchor or {}).get("action") or "").strip()
-        if action in ["replace", "delete", "prompt"]:
-            return action
+    def infer_alert_type(anchor: dict, suggestion: str, message: str) -> str:
         alert_type = str((anchor or {}).get("alert_type") or "").strip()
-        if alert_type == "1":
-            return "delete"
-        if alert_type == "3":
-            return "prompt"
-        return "replace" if str(suggestion or "").strip() else "prompt"
+        if alert_type in {"1", "2", "3"}:
+            return alert_type
+        if str(suggestion or "").strip():
+            return "2"
+        if any(k in str(message or "") for k in ["删除", "删去", "移除", "不应存在"]):
+            return "1"
+        return "3"
 
-    def build_display_items(report: Report, annotation: Optional[Annotation]) -> list:
-        """与查看页一致：优先医生标注，其次回退预标注。"""
-        annotation_data = annotation.data if annotation else {}
-        doctor_items = annotation_data.get("error_items", []) if annotation else []
-        if doctor_items:
-            return doctor_items
+    report_rows = []
+    annotation_rows = []
 
-        pre_items = []
-        for pre in (report.pre_annotations or []):
-            pre_items.append({
-                "error_type": pre.get("err_type") or "",
-                "severity": "",
-                "location": "检查所见" if norm_content_type(pre.get("content_type")) == "description" else "诊断意见",
-                "evidence_text": pre.get("source") or "",
-                "description": pre.get("alert_message") or pre.get("alert_msg") or "",
-                "suggestion": pre.get("target") or "",
-                "anchor": {
-                    "content_type": pre.get("content_type"),
-                    "source_in_start": pre.get("source_in_start"),
-                    "source_in_end": pre.get("source_in_end"),
-                    "alert_type": pre.get("alert_type"),
-                    "source": pre.get("source"),
-                    "target": pre.get("target"),
-                    "action": None,
-                }
-            })
-        return pre_items
+    for report, annotation, _doctor in results:
+        report_rows.append({
+            "RIS_NO": report.ris_no or "",
+            "MODALITY": report.modality or "",
+            "PATIENT_SEX": report.patient_sex or "",
+            "PATIENT_AGE": report.patient_age or "",
+            "EXAM_ITEM": report.exam_item or "",
+            "EXAM_MODE": report.exam_mode or "",
+            "EXAM_GROUP": report.exam_group or "",
+            "DESCRIPTION": report.description or "",
+            "IMPRESSION": report.impression or "",
+        })
 
-    def resolve_range(text: str, source: str, start_val, end_val):
-        start = int(start_val) if str(start_val or "").lstrip("-").isdigit() else None
-        end = int(end_val) if str(end_val or "").lstrip("-").isdigit() else None
-        if (start is not None and start < 0) or (end is not None and end < 0):
-            return 0, 0, True
-
-        candidates = []
-        if start is not None and end is not None:
-            candidates.extend([(start, end), (start - 1, end - 1)])
-        if start is not None and source:
-            slen = len(source)
-            candidates.extend([(start, start + slen), (start - 1, start - 1 + slen)])
-
-        for rs, re in candidates:
-            s = max(0, rs)
-            e = min(len(text), max(s, re))
-            if not source or text[s:e] == source:
-                return s, e, False
-
-        if source:
-            idx = text.find(source)
-            if idx >= 0:
-                return idx, idx + len(source), False
-        return None, None, False
-
-    def build_highlight_segments(text: str, items: list, field: str) -> list:
-        if not text:
-            return [{"text": "", "action": None}]
-        spans = []
-        for item in items:
-            anchor = item.get("anchor") or {}
-            item_field = norm_content_type(anchor.get("content_type") or item.get("location"))
-            if item_field != field:
-                continue
-            source = str(item.get("evidence_text") or anchor.get("source") or "")
-            s, e, missing = resolve_range(text, source, anchor.get("source_in_start"), anchor.get("source_in_end"))
-            if s is None:
-                continue
-            spans.append({
-                "start": s, "end": e, "missing": missing,
-                "action": norm_action(anchor, item.get("suggestion") or ""),
-                "source": source,
-                "suggestion": str(item.get("suggestion") or "")
-            })
-        spans.sort(key=lambda x: (x["start"], x["end"]))
-
-        filtered = []
-        missing_prefix = []
-        last_end = -1
-        for sp in spans:
-            if sp["missing"] or sp["start"] == sp["end"]:
-                missing_prefix.append({"text": f"【缺失:{sp['source']}】", "action": "prompt"})
-                continue
-            if sp["start"] < last_end:
-                continue
-            filtered.append(sp)
-            last_end = sp["end"]
-
-        segments = []
-        cursor = 0
-        for sp in filtered:
-            if sp["start"] > cursor:
-                segments.append({"text": text[cursor:sp["start"]], "action": None})
-            segments.append({"text": text[sp["start"]:sp["end"]], "action": sp["action"]})
-            cursor = sp["end"]
-        if cursor < len(text):
-            segments.append({"text": text[cursor:], "action": None})
-
-        return missing_prefix + (segments or [{"text": text, "action": None}])
-
-    def wrap_segments(segments: list, limit: int = 42) -> list:
-        lines = []
-        current_line = []
-        remaining = limit
-
-        for seg in segments:
-            text = str(seg.get("text") or "")
-            action = seg.get("action")
-            while text:
-                chunk = text[:remaining]
-                current_line.append({"text": chunk, "action": action})
-                text = text[remaining:]
-                remaining -= len(chunk)
-                if remaining == 0:
-                    lines.append(current_line)
-                    current_line = []
-                    remaining = limit
-
-        if current_line:
-            lines.append(current_line)
-        return lines or [[{"text": "", "action": None}]]
-
-    def write_lines(c: canvas.Canvas, y: float, lines: list):
-        for line in lines:
-            if y < 48:
-                c.showPage()
-                c.setFont("STSong-Light", 11)
-                y = A4[1] - 40
-            c.drawString(40, y, line)
-            y -= 16
-        return y
-
-    def draw_segment_line(c: canvas.Canvas, y: float, line_segments: list):
-        x = 40
-        font_name = "STSong-Light"
-        font_size = 11
-
-        for seg in line_segments:
-            text = str(seg.get("text") or "")
-            if not text:
-                continue
-            action = seg.get("action")
-            width = pdfmetrics.stringWidth(text, font_name, font_size)
-
-            if action == "replace":
-                # 替换：黄色底
-                c.setFillColor(colors.Color(1.0, 0.95, 0.75))
-                c.rect(x - 1, y - 3, width + 2, 14, fill=1, stroke=0)
-            elif action == "delete":
-                # 删除：深红底
-                c.setFillColor(colors.Color(0.98, 0.72, 0.72))
-                c.rect(x - 1, y - 3, width + 2, 14, fill=1, stroke=0)
-            elif action == "prompt":
-                # 仅提示：红色边框
-                c.setStrokeColor(colors.Color(0.90, 0.20, 0.20))
-                c.setLineWidth(1)
-                c.rect(x - 1, y - 3, width + 2, 14, fill=0, stroke=1)
-
-            c.setFillColor(colors.black)
-            c.drawString(x, y, text)
-
-            if action == "delete":
-                # 删除线
-                c.setStrokeColor(colors.Color(0.70, 0.05, 0.05))
-                c.setLineWidth(1.3)
-                c.line(x, y + 3.5, x + width, y + 3.5)
-
-            x += width
-
-    def write_segmented_paragraph(c: canvas.Canvas, y: float, title: str, segments: list):
-        y = write_lines(c, y, [title])
-        for line in wrap_segments(segments):
-            if y < 48:
-                c.showPage()
-                c.setFont("STSong-Light", 11)
-                y = A4[1] - 40
-            draw_segment_line(c, y, line)
-            y -= 16
-        return y
-
-    def build_report_pdf_bytes(report: Report, annotation: Optional[Annotation], doctor: Optional[User]) -> bytes:
-        buf = BytesIO()
-        c = canvas.Canvas(buf, pagesize=A4)
-        c.setFont("STSong-Light", 11)
-        y = A4[1] - 40
-
-        annotation_data = annotation.data if annotation else {}
-        error_items = build_display_items(report, annotation)
-        from_source = "医生标注" if annotation_data.get("error_items") else "预标注建议"
-
-        header = [
-            f"检查号: {report.ris_no or ''}    报告ID: {report.id}",
-            f"检查类型: {report.modality or ''}    检查项目: {report.exam_item or ''}",
-            f"标注医生: {doctor.username if doctor else ''}    状态: {report.status or ''}",
-            f"提交时间: {report.submitted_at.isoformat() if report.submitted_at else ''}",
-            f"修改来源: {from_source}",
-            "-" * 62,
-        ]
-        y = write_lines(c, y, header)
-
-        y = write_segmented_paragraph(
-            c, y, "【检查所见 - 标注后】", build_highlight_segments(report.description or "", error_items, "description")
-        )
-        y -= 6
-        y = write_segmented_paragraph(
-            c, y, "【诊断意见 - 标注后】", build_highlight_segments(report.impression or "", error_items, "impression")
-        )
-        y -= 6
-
-        y = write_lines(c, y, ["【修改标注明细】"])
-        if not error_items:
-            y = write_lines(c, y, ["无标注修改项"])
+        export_items = []
+        if annotation and annotation.data and annotation.data.get("error_items"):
+            export_items = annotation.data.get("error_items") or []
         else:
-            for idx, item in enumerate(error_items, start=1):
-                anchor = item.get("anchor") or {}
-                action = norm_action(anchor, item.get("suggestion") or "")
-                action_text = {"replace": "替换内容", "delete": "删除内容并提示", "prompt": "仅作提示"}[action]
-                lines = [
-                    f"{idx}. 字段: {'检查所见' if norm_content_type(anchor.get('content_type')) == 'description' else '诊断意见'}",
-                    f"   错误文本: {item.get('evidence_text') or anchor.get('source') or ''}",
-                    f"   处理方式: {action_text}",
-                    f"   替换内容: {item.get('suggestion') or anchor.get('target') or ''}",
-                    f"   建议说明: {item.get('description') or ''}",
-                ]
-                y = write_lines(c, y, lines)
+            for pre in (report.pre_annotations or []):
+                export_items.append({
+                    "error_type": pre.get("err_type") or "",
+                    "evidence_text": pre.get("source") or "",
+                    "description": pre.get("alert_message") or pre.get("alert_msg") or "",
+                    "suggestion": pre.get("target") or "",
+                    "anchor": {
+                        "content_type": pre.get("content_type"),
+                        "source_in_start": pre.get("source_in_start"),
+                        "source_in_end": pre.get("source_in_end"),
+                        "alert_type": pre.get("alert_type"),
+                        "source": pre.get("source"),
+                        "target": pre.get("target"),
+                    }
+                })
 
-        c.showPage()
-        c.save()
-        return buf.getvalue()
+        if not export_items:
+            annotation_rows.append({
+                "RIS_NO": report.ris_no or "",
+                "CONTENT_TYPE": "",
+                "ERR_TYPE": "",
+                "SOURCE": "",
+                "TARGET": "",
+                "ALERT_TYPE": "",
+                "ALERT_MSG": "",
+                "SOURCE_IN_START": "",
+                "SOURCE_IN_END": "",
+                "SOURCE_IN_LENGTH": "",
+            })
+            continue
 
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
-        for report, annotation, doctor in results:
-            pdf_bytes = build_report_pdf_bytes(report, annotation, doctor)
-            safe_ris_no = (report.ris_no or report.external_id or str(report.id)).replace("/", "_").replace("\\", "_")
-            zipf.writestr(f"{safe_ris_no}.pdf", pdf_bytes)
+        for item in export_items:
+            anchor = item.get("anchor") or {}
+            source = str(item.get("evidence_text") or anchor.get("source") or "")
+            target = str(item.get("suggestion") or anchor.get("target") or "")
+            message = str(item.get("description") or "")
+            start = anchor.get("source_in_start")
+            end = anchor.get("source_in_end")
+            start_text = str(start) if start is not None else ""
+            end_text = str(end) if end is not None else ""
+            source_length = ""
+            if start is not None and end is not None and str(start).lstrip("-").isdigit() and str(end).lstrip("-").isdigit():
+                source_length = str(max(0, int(end) - int(start)))
+
+            annotation_rows.append({
+                "RIS_NO": report.ris_no or "",
+                "CONTENT_TYPE": normalize_content_type(anchor.get("content_type")),
+                "ERR_TYPE": item.get("error_type") or "",
+                "SOURCE": source,
+                "TARGET": target,
+                "ALERT_TYPE": infer_alert_type(anchor, target, message),
+                "ALERT_MSG": message,
+                "SOURCE_IN_START": start_text,
+                "SOURCE_IN_END": end_text,
+                "SOURCE_IN_LENGTH": source_length,
+            })
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(report_rows).to_excel(writer, index=False, sheet_name="原始报告")
+        pd.DataFrame(annotation_rows).to_excel(writer, index=False, sheet_name="预标注")
 
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"annotated_reports_{timestamp}.zip"
+    filename = f"annotated_reports_{timestamp}.xlsx"
     return Response(
-        content=zip_buffer.getvalue(),
-        media_type="application/zip",
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 

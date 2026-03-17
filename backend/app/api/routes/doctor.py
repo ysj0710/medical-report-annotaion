@@ -30,11 +30,13 @@ def list_doctor_reports(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=1000),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(["doctor"]))
+    current_user: User = Depends(require_role(["doctor", "admin"]))
 ):
     """医生端报告列表"""
     # 根据 can_view_all 权限决定过滤条件
-    if current_user.can_view_all and not only_mine:
+    if current_user.role == "admin":
+        query = db.query(Report).filter(Report.is_cancel == False)
+    elif current_user.can_view_all and not only_mine:
         # 可以查看所有报告
         query = db.query(Report).filter(Report.is_cancel == False)
     else:
@@ -65,10 +67,10 @@ def list_doctor_reports(
     # 获取每个报告的标注
     items = []
     for report in all_reports:
-        annotation = db.query(Annotation).filter(
-            Annotation.report_id == report.id,
-            Annotation.doctor_id == current_user.id
-        ).first()
+        annotation_query = db.query(Annotation).filter(Annotation.report_id == report.id)
+        if current_user.role != "admin":
+            annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
+        annotation = annotation_query.first()
 
         # tab == no_error 时过滤
         if tab == "no_error" and annotation:
@@ -124,11 +126,11 @@ def list_doctor_reports(
 def get_doctor_report(
     report_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(["doctor"]))
+    current_user: User = Depends(require_role(["doctor", "admin"]))
 ):
     """医生获取报告详情"""
     # 根据 can_view_all 权限决定过滤条件
-    if current_user.can_view_all:
+    if current_user.role == "admin" or current_user.can_view_all:
         report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     else:
         report = db.query(Report).filter(
@@ -139,10 +141,10 @@ def get_doctor_report(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    annotation = db.query(Annotation).filter(
-        Annotation.report_id == report_id,
-        Annotation.doctor_id == current_user.id
-    ).first()
+    annotation_query = db.query(Annotation).filter(Annotation.report_id == report_id)
+    if current_user.role != "admin":
+        annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
+    annotation = annotation_query.first()
 
     return DoctorReportResponse(
         id=report.id,
@@ -173,11 +175,11 @@ def save_draft(
     report_id: int,
     request: DraftRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(["doctor"]))
+    current_user: User = Depends(require_role(["doctor", "admin"]))
 ):
     """保存草稿"""
     # 根据 can_view_all 权限决定过滤条件
-    if current_user.can_view_all:
+    if current_user.role == "admin" or current_user.can_view_all:
         report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     else:
         report = db.query(Report).filter(
@@ -193,15 +195,16 @@ def save_draft(
     now = datetime.utcnow()
 
     # 查找或创建标注
-    annotation = db.query(Annotation).filter(
-        Annotation.report_id == report_id,
-        Annotation.doctor_id == current_user.id
-    ).first()
+    annotation_query = db.query(Annotation).filter(Annotation.report_id == report_id)
+    if current_user.role != "admin":
+        annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
+    annotation = annotation_query.first()
 
     if not annotation:
+        annotation_owner_id = report.assigned_doctor_id or current_user.id
         annotation = Annotation(
             report_id=report_id,
-            doctor_id=current_user.id,
+            doctor_id=annotation_owner_id,
             status="DRAFT"
         )
         db.add(annotation)
@@ -225,11 +228,11 @@ def submit_annotation(
     report_id: int,
     request: SubmitRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(["doctor"]))
+    current_user: User = Depends(require_role(["doctor", "admin"]))
 ):
     """提交标注"""
     # 根据 can_view_all 权限决定过滤条件
-    if current_user.can_view_all:
+    if current_user.role == "admin" or current_user.can_view_all:
         report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     else:
         report = db.query(Report).filter(
@@ -245,15 +248,16 @@ def submit_annotation(
     now = datetime.utcnow()
 
     # 查找或创建标注
-    annotation = db.query(Annotation).filter(
-        Annotation.report_id == report_id,
-        Annotation.doctor_id == current_user.id
-    ).first()
+    annotation_query = db.query(Annotation).filter(Annotation.report_id == report_id)
+    if current_user.role != "admin":
+        annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
+    annotation = annotation_query.first()
 
     if not annotation:
+        annotation_owner_id = report.assigned_doctor_id or current_user.id
         annotation = Annotation(
             report_id=report_id,
-            doctor_id=current_user.id
+            doctor_id=annotation_owner_id
         )
         db.add(annotation)
 
@@ -267,12 +271,14 @@ def submit_annotation(
     report.submitted_at = now
 
     # 查找下一个报告
-    next_report = db.query(Report).filter(
+    next_report_query = db.query(Report).filter(
         Report.id != report_id,
-        Report.assigned_doctor_id == current_user.id,
         Report.is_cancel == False,
         Report.status.in_([STATUS_ASSIGNED, STATUS_IN_PROGRESS])
-    ).first()
+    )
+    if current_user.role != "admin":
+        next_report_query = next_report_query.filter(Report.assigned_doctor_id == current_user.id)
+    next_report = next_report_query.first()
 
     db.commit()
 
@@ -287,10 +293,10 @@ def submit_annotation(
 def cancel_annotation(
     report_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(["doctor"]))
+    current_user: User = Depends(require_role(["doctor", "admin"]))
 ):
     """取消已提交标注，回到待标注状态"""
-    if current_user.can_view_all:
+    if current_user.role == "admin" or current_user.can_view_all:
         report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     else:
         report = db.query(Report).filter(
@@ -301,10 +307,10 @@ def cancel_annotation(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    annotation = db.query(Annotation).filter(
-        Annotation.report_id == report_id,
-        Annotation.doctor_id == current_user.id
-    ).first()
+    annotation_query = db.query(Annotation).filter(Annotation.report_id == report_id)
+    if current_user.role != "admin":
+        annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
+    annotation = annotation_query.first()
 
     if annotation:
         db.delete(annotation)
