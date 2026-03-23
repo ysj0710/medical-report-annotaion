@@ -97,6 +97,7 @@
           <div class="report-meta">检查号：{{ currentReport?.ris_no || '-' }}</div>
         </div>
         <div class="middle-actions">
+          <el-checkbox v-model="autoGoNextAfterSubmit" class="auto-next-toggle">完成之后自动进入下一个</el-checkbox>
           <el-button @click="goPrevReport">上一个</el-button>
           <el-button @click="goNextReport">下一个</el-button>
           <el-button type="primary" @click="createManualCardFromSelection" :disabled="isReportAnnotated">标注选中文本</el-button>
@@ -143,7 +144,7 @@
                 <el-tag size="small" :type="card.kind === 'pre' ? 'warning' : 'primary'">
                   {{ card.kind === 'pre' ? '预标注' : '手动标注' }}
                 </el-tag>
-                <span class="card-index">#{{ idx + 1 }}</span>
+                <sup class="card-index">{{ idx + 1 }}</sup>
               </div>
               <div class="card-field">{{ fieldText(card.content_type) }}</div>
             </div>
@@ -158,9 +159,9 @@
                 <el-option v-for="item in errorTypeOptions" :key="item.value" :label="item.label" :value="item.value" />
               </el-select>
               <el-button-group class="severity-group">
-                <el-button :type="card.severity === 'low' ? 'success' : 'default'" @click="card.severity = 'low'">低风险</el-button>
-                <el-button :type="card.severity === 'medium' ? 'warning' : 'default'" @click="card.severity = 'medium'">中风险</el-button>
-                <el-button :type="card.severity === 'high' ? 'danger' : 'default'" @click="card.severity = 'high'">高风险</el-button>
+                <el-button :type="card.severity === 'low' ? 'success' : 'default'" @click="card.severity = 'low'">低</el-button>
+                <el-button :type="card.severity === 'medium' ? 'warning' : 'default'" @click="card.severity = 'medium'">中</el-button>
+                <el-button :type="card.severity === 'high' ? 'danger' : 'default'" @click="card.severity = 'high'">高</el-button>
               </el-button-group>
               <el-input
                 v-model="card.target"
@@ -178,7 +179,7 @@
             <div v-else>
               <div class="row"><span class="label">错误类型：</span>{{ errorTypeText(card.error_type) }}</div>
               <div class="row"><span class="label">错误级别：</span>{{ severityText(card.severity) }}</div>
-              <div class="row"><span class="label">建议说明：</span>{{ card.alert_message || '-' }}</div>
+              <div class="row"><span class="label">建议说明：</span>{{ getCardSuggestionText(card) }}</div>
             </div>
           </div>
 
@@ -227,6 +228,7 @@ const cards = ref([])
 const selectedCardId = ref(null)
 
 const submitting = ref(false)
+const autoGoNextAfterSubmit = ref(true)
 const autoSaving = ref(false)
 const autoSavePending = ref(false)
 const progress = ref({ done: 0, total: 0 })
@@ -360,6 +362,31 @@ const errorTypeText = (type) => ERROR_TYPE_MAP[type] || type || '-'
 const normalizeAction = (action) => {
   if (['replace', 'delete', 'prompt'].includes(action)) return action
   return 'prompt'
+}
+
+const normalizeInputText = (value) => String(value ?? '').trim()
+
+const buildReplaceSuggestionText = (source, target) => {
+  const sourceText = normalizeInputText(source)
+  const targetText = normalizeInputText(target)
+  if (!sourceText || !targetText) return ''
+  return `建议“${sourceText}”替换为“${targetText}”`
+}
+
+const buildActionSuggestionText = (card) => {
+  const sourceText = normalizeInputText(card.source)
+  const action = normalizeAction(card.action || inferActionByCard(card))
+  if (action === 'replace') return buildReplaceSuggestionText(sourceText, card.target)
+  if (action === 'delete' && sourceText) return `建议删除“${sourceText}”`
+  if (action === 'prompt' && sourceText) return `请确认“${sourceText}”是否准确`
+  return ''
+}
+
+const getCardSuggestionText = (card) => {
+  const messageText = normalizeInputText(card.alert_message)
+  if (messageText) return messageText
+  const autoText = buildReplaceSuggestionText(card.source, card.target)
+  return autoText || '-'
 }
 
 const inferActionByCard = (card) => {
@@ -705,8 +732,8 @@ const buildManualCardsFromAnnotation = (report) => {
   return annotation.error_items.map((item, idx) => {
     const card = {
       id: `manual-${report.id}-${idx}`,
-      kind: 'manual',
-      state: 'saved',
+      kind: item.anchor?.kind === 'pre' ? 'pre' : 'manual',
+      state: item.anchor?.state === 'pending' ? 'pending' : 'saved',
       content_type: item.anchor?.content_type || item.location || 'description',
       source: item.evidence_text || item.anchor?.source || '',
       target: item.suggestion || item.anchor?.target || '',
@@ -749,13 +776,24 @@ const dedupeCards = (items) => {
   return result
 }
 
+const buildCardAnchorKey = (card) => {
+  return [
+    normalizeContentType(card.content_type),
+    String(card.source || '').trim(),
+    String(card.source_in_start ?? ''),
+    String(card.source_in_end ?? '')
+  ].join('||')
+}
+
 const openReport = async (report) => {
   const detail = await api.getDoctorReport(report.id)
   currentReport.value = detail
 
   const preCards = buildPreCards(detail)
   const manualCards = buildManualCardsFromAnnotation(detail)
-  cards.value = dedupeCards([...preCards, ...manualCards])
+  const savedAnchorKeys = new Set(manualCards.map((card) => buildCardAnchorKey(card)))
+  const remainingPreCards = preCards.filter((card) => !savedAnchorKeys.has(buildCardAnchorKey(card)))
+  cards.value = dedupeCards([...manualCards, ...remainingPreCards])
   selectedCardId.value = cards.value[0]?.id || null
 
   await nextTick()
@@ -799,15 +837,60 @@ const editCard = (card) => {
   selectedCardId.value = card.id
 }
 
-const saveCard = async (card) => {
+const prepareCardForSave = async (card, options = {}) => {
+  const { showValidationDialog = true, allowAutoSuggestionWhenEmpty = false } = options
+
+  card.target = normalizeInputText(card.target)
+  card.alert_message = normalizeInputText(card.alert_message)
   applyDefaultSeverity(card)
+
+  const hasTarget = !!card.target
+  const hasAlertMessage = !!card.alert_message
+
+  if (!hasTarget && !hasAlertMessage) {
+    if (allowAutoSuggestionWhenEmpty) {
+      card.action = inferActionByCard(card)
+      card.alert_message = buildActionSuggestionText(card) || '请复核该处表述是否准确'
+    } else {
+      if (showValidationDialog) {
+        try {
+          await ElMessageBox.alert(
+            '非替换操作请填写建议说明，或填写替换后内容后再保存。',
+            '保存前校验',
+            { confirmButtonText: '我知道了', type: 'warning' }
+          )
+        } catch (_e) {
+          // ignore close action
+        }
+      }
+      return false
+    }
+  }
+
+  if (hasTarget) {
+    card.action = 'replace'
+    if (!card.alert_message) {
+      card.alert_message = buildReplaceSuggestionText(card.source, card.target)
+    }
+  } else {
+    card.action = inferActionByCard(card)
+  }
+
   syncActionToAlertType(card)
+
   if (card.action !== 'replace') {
     card.target = ''
+    if (!card.alert_message) {
+      card.alert_message = buildActionSuggestionText(card)
+    }
   }
-  if (card.kind === 'pre') {
-    card.kind = 'manual'
-  }
+
+  return true
+}
+
+const saveCard = async (card) => {
+  const canSave = await prepareCardForSave(card)
+  if (!canSave) return
   card.state = 'saved'
   card._backup = null
   await autoSaveAfterInteraction()
@@ -826,12 +909,11 @@ const removeManualCard = (card) => {
 }
 
 const confirmPreCard = async (card) => {
-  applyDefaultSeverity(card)
-  syncActionToAlertType(card)
-  if (card.action !== 'replace') {
-    card.target = ''
-  }
-  card.kind = 'manual'
+  const canSave = await prepareCardForSave(card, {
+    showValidationDialog: false,
+    allowAutoSuggestionWhenEmpty: true
+  })
+  if (!canSave) return
   card.state = 'saved'
   card._backup = null
   await autoSaveAfterInteraction()
@@ -910,15 +992,16 @@ const createManualCardFromSelection = () => {
   selectedCardId.value = newCard.id
 }
 
-const remindUnsubmitted = async () => {
+const remindUnsubmitted = async (offset = 1) => {
   if (!currentReport.value || isReportAnnotated.value) return 'pass'
+  const directionText = offset < 0 ? '上一份' : '下一份'
   try {
     await ElMessageBox.confirm(
-      '该报告已暂存，暂未确认标注完成。你可以立即确认完成标注，或继续查看下一份报告。',
+      `该报告已暂存，暂未确认标注完成。你可以立即确认完成标注，或继续查看${directionText}报告。`,
       '切换提示',
       {
         confirmButtonText: '立即确认完成标注',
-        cancelButtonText: '仍要查看下一份报告',
+        cancelButtonText: `仍要查看${directionText}报告`,
         distinguishCancelAndClose: true,
         closeOnClickModal: false,
         closeOnPressEscape: true,
@@ -934,7 +1017,7 @@ const remindUnsubmitted = async () => {
 
 const switchReportByOffset = async (offset) => {
   if (!reportList.value.length) return
-  const intent = await remindUnsubmitted()
+  const intent = await remindUnsubmitted(offset)
   if (intent === 'abort') return
   const previousReportId = currentReport.value?.id
   const currentIdx = currentReportIndex.value
@@ -944,6 +1027,8 @@ const switchReportByOffset = async (offset) => {
   const fallbackTargetId = reportList.value[targetIdx]?.id
 
   if (intent === 'submit' && currentReport.value && !isReportAnnotated.value) {
+    const canSubmit = await ensurePreCardsReadyBeforeSubmit()
+    if (!canSubmit) return
     try {
       await api.submitAnnotation(currentReport.value.id, buildPayload())
       updateCurrentReportStatusLocally('SUBMITTED')
@@ -976,16 +1061,80 @@ const switchReportByOffset = async (offset) => {
 const goPrevReport = async () => switchReportByOffset(-1)
 const goNextReport = async () => switchReportByOffset(1)
 
+const clearCurrentReport = () => {
+  currentReport.value = null
+  cards.value = []
+  selectedCardId.value = null
+  doctorTableRef.value?.setCurrentRow(null)
+}
+
+const resolveReportAfterSubmit = (previousReportId, previousIndex, offset = 0) => {
+  if (!reportList.value.length) return null
+
+  const sameIdx = reportList.value.findIndex((item) => item.id === previousReportId)
+  if (sameIdx >= 0) {
+    const targetIdx = (sameIdx + offset + reportList.value.length) % reportList.value.length
+    return reportList.value[targetIdx] || null
+  }
+
+  const normalizedIdx = Math.min(Math.max(previousIndex, 0), reportList.value.length - 1)
+  return reportList.value[normalizedIdx] || null
+}
+
+const autoConfirmPendingPreCards = async () => {
+  const pendingCards = cards.value.filter((card) => card.kind === 'pre' && card.state === 'pending')
+  if (!pendingCards.length) return
+
+  for (const card of pendingCards) {
+    await prepareCardForSave(card, {
+      showValidationDialog: false,
+      allowAutoSuggestionWhenEmpty: true
+    })
+    card.state = 'saved'
+    card._backup = null
+  }
+}
+
+const ensurePreCardsReadyBeforeSubmit = async () => {
+  const pendingPreCount = cards.value.filter((card) => card.kind === 'pre' && card.state === 'pending').length
+  if (pendingPreCount <= 0) return true
+
+  try {
+    await ElMessageBox.confirm(
+      '存在未确认的预标注，是否自动完成确认，并执行完成标注操作？',
+      '完成前确认',
+      {
+        confirmButtonText: '是',
+        cancelButtonText: '否',
+        type: 'warning'
+      }
+    )
+    await autoConfirmPendingPreCards()
+    return true
+  } catch (_e) {
+    return false
+  }
+}
+
 const submitReport = async () => {
   if (!currentReport.value || isReportAnnotated.value) return
+  const canSubmit = await ensurePreCardsReadyBeforeSubmit()
+  if (!canSubmit) return
+
+  const previousReportId = currentReport.value.id
+  const previousIndex = currentReportIndex.value
   submitting.value = true
   try {
     await api.submitAnnotation(currentReport.value.id, buildPayload())
     ElMessage.success('标注完成')
     await loadReports()
-    const latest = reportList.value.find((item) => item.id === currentReport.value?.id)
-    if (latest) {
-      await openReport(latest)
+
+    const offset = autoGoNextAfterSubmit.value ? 1 : 0
+    const targetReport = resolveReportAfterSubmit(previousReportId, previousIndex, offset)
+    if (targetReport) {
+      await openReport(targetReport)
+    } else {
+      clearCurrentReport()
     }
   } catch (e) {
     ElMessage.error(e.message)
@@ -996,9 +1145,10 @@ const submitReport = async () => {
 
 const cancelSubmittedAnnotation = async () => {
   if (!currentReport.value || !isReportAnnotated.value) return
+  const reportId = currentReport.value.id
   try {
     await ElMessageBox.confirm(
-      '取消后将清空当前报告已提交标注，并回到待标注状态，是否继续？',
+      '取消后，当前报告将回到待标注状态，是否继续？',
       '取消标注确认',
       {
         confirmButtonText: '确认取消',
@@ -1006,10 +1156,15 @@ const cancelSubmittedAnnotation = async () => {
         type: 'warning'
       }
     )
-    await api.cancelAnnotation(currentReport.value.id)
-    ElMessage.success('已取消，您可以重新标注')
-    await openReport(currentReport.value)
+    await api.cancelAnnotation(reportId)
+    ElMessage.success('已取消标注，当前报告已恢复为可编辑状态')
     await loadReports()
+    const refreshed = reportList.value.find((item) => item.id === reportId)
+    if (refreshed) {
+      await openReport(refreshed)
+    } else {
+      clearCurrentReport()
+    }
   } catch (_e) {
     // ignore
   }
@@ -1162,7 +1317,14 @@ onMounted(async () => {
 
 .middle-actions {
   display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
+}
+
+.auto-next-toggle {
+  margin-right: 2px;
 }
 
 .report-sheet {
@@ -1298,9 +1460,19 @@ onMounted(async () => {
 }
 
 .card-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 14px;
+  height: 14px;
+  line-height: 14px;
   margin-left: 6px;
-  color: #6b7280;
-  font-size: 12px;
+  border-radius: 999px;
+  text-align: center;
+  font-size: 10px;
+  color: #fff;
+  background: #ef4444;
+  vertical-align: super;
 }
 
 .card-field {

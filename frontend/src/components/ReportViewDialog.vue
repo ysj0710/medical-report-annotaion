@@ -304,7 +304,12 @@ const suggestionList = computed(() => {
         : (anno.content_type || '未知字段'),
     errType: ERR_TYPE_MAP[anno.err_type] || anno.err_type || "错误",
     source: anno.source || "",
-    alertMessage: anno.alert_message || anno.alert_msg || "",
+    alertMessage: (anno.alert_message || anno.alert_msg || '').trim()
+      || (
+        String(anno.source || '').trim() && String(anno.target || '').trim()
+          ? `建议“${String(anno.source || '').trim()}”替换为“${String(anno.target || '').trim()}”`
+          : ''
+      ),
   }))
 })
 

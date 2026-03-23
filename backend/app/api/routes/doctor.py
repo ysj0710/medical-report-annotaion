@@ -313,9 +313,10 @@ def cancel_annotation(
     annotation = annotation_query.first()
 
     if annotation:
-        db.delete(annotation)
+        annotation.status = "DRAFT"
+        annotation.submitted_at = None
 
-    report.status = STATUS_ASSIGNED
+    report.status = STATUS_IN_PROGRESS if annotation else STATUS_ASSIGNED
     report.submitted_at = None
     db.commit()
     return {"ok": True}
