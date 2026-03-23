@@ -129,14 +129,16 @@
 
     <aside class="right-panel">
       <div class="right-header">纠错建议</div>
-      <div class="cards">
+      <div class="cards" ref="cardsContainerRef">
         <el-empty v-if="cards.length === 0" description="暂无纠错卡片" />
 
         <el-card
           v-for="(card, idx) in cards"
           :key="card.id"
+          :data-card-id="card.id"
           :class="['error-card', { selected: selectedCardId === card.id }]"
           shadow="hover"
+          @click="handleCardClick(card, $event)"
         >
           <template #header>
             <div class="card-head">
@@ -158,6 +160,7 @@
               <el-select v-model="card.error_type" placeholder="错误类型" style="width: 100%; margin-bottom: 8px" @change="applyDefaultSeverity(card)">
                 <el-option v-for="item in errorTypeOptions" :key="item.value" :label="item.label" :value="item.value" />
               </el-select>
+              <div class="level-title">错误级别</div>
               <el-button-group class="severity-group">
                 <el-button :type="card.severity === 'low' ? 'success' : 'default'" @click="card.severity = 'low'">低</el-button>
                 <el-button :type="card.severity === 'medium' ? 'warning' : 'default'" @click="card.severity = 'medium'">中</el-button>
@@ -185,18 +188,28 @@
 
           <div class="card-actions">
             <template v-if="card.kind === 'pre'">
-              <el-button v-if="card.state === 'pending'" size="small" type="success" @click="confirmPreCard(card)" :disabled="isReportAnnotated">确认</el-button>
-              <el-button v-if="card.state === 'pending'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
-              <el-button v-if="card.state === 'saved'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" @click="cancelEdit(card)">取消</el-button>
+              <el-button v-if="card.state === 'pending'" size="small" type="success" @click.stop="confirmPreCard(card)" :disabled="isReportAnnotated">确认</el-button>
+              <el-button v-if="card.state === 'pending'" size="small" @click.stop="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
+              <el-button v-if="card.state === 'saved'" size="small" @click.stop="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
+              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click.stop="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
+              <el-button v-if="card.state === 'editing'" size="small" @click.stop="cancelEdit(card)">取消</el-button>
             </template>
 
             <template v-else>
-              <el-button v-if="card.state !== 'editing'" size="small" @click="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" @click="removeManualCard(card)">取消</el-button>
+              <el-button v-if="card.state !== 'editing'" size="small" @click.stop="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
+              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click.stop="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
+              <el-button v-if="card.state === 'editing'" size="small" @click.stop="cancelEdit(card)">取消</el-button>
             </template>
+            <el-button
+              size="small"
+              type="danger"
+              plain
+              class="revoke-btn"
+              @click.stop="revokeCard(card)"
+              :disabled="isReportAnnotated"
+            >
+              撤销
+            </el-button>
           </div>
         </el-card>
       </div>
@@ -205,7 +218,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
 
@@ -215,6 +228,7 @@ const props = defineProps({
 })
 
 const TASK_COLUMNS_STORAGE_KEY = 'doctor_task_visible_columns_v1'
+const DISMISSED_PRE_STORAGE_KEY = 'doctor_dismissed_pre_cards_v1'
 
 const activeFilter = ref('all')
 const reportQuery = ref('')
@@ -222,6 +236,7 @@ const onlyMine = ref(true)
 const currentUser = ref(null)
 
 const doctorTableRef = ref(null)
+const cardsContainerRef = ref(null)
 const reportList = ref([])
 const currentReport = ref(null)
 const cards = ref([])
@@ -232,6 +247,8 @@ const autoGoNextAfterSubmit = ref(true)
 const autoSaving = ref(false)
 const autoSavePending = ref(false)
 const progress = ref({ done: 0, total: 0 })
+const dismissedPreCardKeysByReport = new Map()
+let highlightFocusTimer = null
 
 const doctorTableColumns = [
   { key: 'ris_no', label: '检查号(RIS_NO)', prop: 'ris_no', width: 150 },
@@ -424,6 +441,121 @@ const syncActionToAlertType = (card) => {
 
 const isEditing = (card) => card.state === 'editing'
 
+const getSafeSelectorValue = (value) => {
+  const text = String(value ?? '')
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+    return CSS.escape(text)
+  }
+  return text.replace(/["\\]/g, '\\$&')
+}
+
+const scrollToCard = async (cardId, behavior = 'smooth') => {
+  await nextTick()
+  const container = cardsContainerRef.value
+  if (!container || !cardId) return
+  const safeId = getSafeSelectorValue(cardId)
+  const cardEl = container.querySelector(`.error-card[data-card-id="${safeId}"]`)
+  cardEl?.scrollIntoView({ behavior, block: 'nearest' })
+}
+
+const clearHighlightFocus = () => {
+  document.querySelectorAll('.section-content .hl-chip.hl-focus').forEach((el) => {
+    el.classList.remove('hl-focus')
+  })
+  if (highlightFocusTimer) {
+    clearTimeout(highlightFocusTimer)
+    highlightFocusTimer = null
+  }
+}
+
+const getHighlightElementByCardId = (cardId) => {
+  const safeId = getSafeSelectorValue(cardId)
+  const chip = document.querySelector(`.section-content .hl-chip[data-card-id="${safeId}"]`)
+  if (chip) return chip
+  const mark = document.querySelector(`.section-content .hl-mark[data-card-id="${safeId}"]`)
+  return mark?.closest('.hl-chip') || mark || null
+}
+
+const focusCardHighlight = async (card, options = {}) => {
+  if (!card?.id) return
+  const { scrollToText = true, scrollToCardList = false } = options
+  selectedCardId.value = card.id
+  if (scrollToCardList) {
+    await scrollToCard(card.id)
+  }
+  await nextTick()
+  const target = getHighlightElementByCardId(card.id)
+  if (!target) return
+  clearHighlightFocus()
+  if (scrollToText) {
+    target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })
+  }
+  target.classList.add('hl-focus')
+  highlightFocusTimer = window.setTimeout(() => {
+    target.classList.remove('hl-focus')
+    highlightFocusTimer = null
+  }, 1500)
+}
+
+const handleCardClick = async (card, event) => {
+  const target = event?.target
+  if (target?.closest('.card-actions, .el-input, .el-textarea, .el-select, .el-button')) {
+    return
+  }
+  await focusCardHighlight(card, { scrollToText: true, scrollToCardList: false })
+}
+
+const ensureDismissedSet = (reportId) => {
+  if (!dismissedPreCardKeysByReport.has(reportId)) {
+    dismissedPreCardKeysByReport.set(reportId, new Set())
+  }
+  return dismissedPreCardKeysByReport.get(reportId)
+}
+
+const persistDismissedPreCardKeys = () => {
+  const payload = {}
+  dismissedPreCardKeysByReport.forEach((set, reportId) => {
+    if (set.size > 0) {
+      payload[String(reportId)] = Array.from(set)
+    }
+  })
+  localStorage.setItem(DISMISSED_PRE_STORAGE_KEY, JSON.stringify(payload))
+}
+
+const restoreDismissedPreCardKeys = () => {
+  const raw = localStorage.getItem(DISMISSED_PRE_STORAGE_KEY)
+  if (!raw) return
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return
+    Object.entries(parsed).forEach(([reportId, keys]) => {
+      if (!Array.isArray(keys) || !keys.length) return
+      const numericReportId = Number(reportId)
+      if (!Number.isFinite(numericReportId)) return
+      dismissedPreCardKeysByReport.set(numericReportId, new Set(keys.map((item) => String(item))))
+    })
+  } catch (_e) {
+    localStorage.removeItem(DISMISSED_PRE_STORAGE_KEY)
+  }
+}
+
+const markPreCardDismissed = (reportId, card) => {
+  if (!reportId || !card) return
+  ensureDismissedSet(reportId).add(buildCardAnchorKey(card))
+  persistDismissedPreCardKeys()
+}
+
+const unmarkPreCardDismissed = (reportId, card) => {
+  if (!reportId || !card) return
+  const set = dismissedPreCardKeysByReport.get(reportId)
+  if (!set) return
+  set.delete(buildCardAnchorKey(card))
+  if (set.size === 0) {
+    dismissedPreCardKeysByReport.delete(reportId)
+  }
+  persistDismissedPreCardKeys()
+}
+
 const applyDefaultSeverity = (card) => {
   if (!card.severity) card.severity = riskByErrorType(card.error_type)
 }
@@ -588,6 +720,7 @@ const handleHighlightClick = (event) => {
   const mark = event.target.closest('.hl-mark')
   if (mark?.dataset.cardId) {
     selectedCardId.value = mark.dataset.cardId
+    scrollToCard(mark.dataset.cardId)
     return
   }
   const chip = event.target.closest('.hl-chip')
@@ -595,6 +728,7 @@ const handleHighlightClick = (event) => {
   const cardId = chip.dataset.cardId
   if (!cardId) return
   selectedCardId.value = cardId
+  scrollToCard(cardId)
 }
 
 const cardToErrorItem = (card) => {
@@ -613,6 +747,7 @@ const cardToErrorItem = (card) => {
       source: card.source,
       target: card.target,
       kind: card.kind,
+      origin_kind: card.origin_kind,
       state: card.state,
       action: card.action
     }
@@ -690,6 +825,7 @@ const buildPreCards = (report) => {
       const card = {
         id: `pre-${report.id}-${idx}`,
         kind: 'pre',
+        origin_kind: 'pre',
         state: 'pending',
         content_type: item.content_type || '',
         source: item.source || '',
@@ -730,10 +866,14 @@ const buildManualCardsFromAnnotation = (report) => {
   if (!annotation?.error_items?.length) return []
 
   return annotation.error_items.map((item, idx) => {
+    const anchorKind = item.anchor?.kind
+    const anchorState = item.anchor?.state
+    const isPendingPre = anchorKind === 'pre' && anchorState === 'pending'
     const card = {
       id: `manual-${report.id}-${idx}`,
-      kind: item.anchor?.kind === 'pre' ? 'pre' : 'manual',
-      state: item.anchor?.state === 'pending' ? 'pending' : 'saved',
+      kind: isPendingPre ? 'pre' : 'manual',
+      origin_kind: item.anchor?.origin_kind || (anchorKind === 'pre' ? 'pre' : 'manual'),
+      state: isPendingPre ? 'pending' : 'saved',
       content_type: item.anchor?.content_type || item.location || 'description',
       source: item.evidence_text || item.anchor?.source || '',
       target: item.suggestion || item.anchor?.target || '',
@@ -791,8 +931,10 @@ const openReport = async (report) => {
 
   const preCards = buildPreCards(detail)
   const manualCards = buildManualCardsFromAnnotation(detail)
+  const dismissedKeys = dismissedPreCardKeysByReport.get(detail.id) || new Set()
+  const visiblePreCards = preCards.filter((card) => !dismissedKeys.has(buildCardAnchorKey(card)))
   const savedAnchorKeys = new Set(manualCards.map((card) => buildCardAnchorKey(card)))
-  const remainingPreCards = preCards.filter((card) => !savedAnchorKeys.has(buildCardAnchorKey(card)))
+  const remainingPreCards = visiblePreCards.filter((card) => !savedAnchorKeys.has(buildCardAnchorKey(card)))
   cards.value = dedupeCards([...manualCards, ...remainingPreCards])
   selectedCardId.value = cards.value[0]?.id || null
 
@@ -891,6 +1033,11 @@ const prepareCardForSave = async (card, options = {}) => {
 const saveCard = async (card) => {
   const canSave = await prepareCardForSave(card)
   if (!canSave) return
+  if (card.kind === 'pre') {
+    card.kind = 'manual'
+    card.origin_kind = 'pre'
+    unmarkPreCardDismissed(currentReport.value?.id, card)
+  }
   card.state = 'saved'
   card._backup = null
   await autoSaveAfterInteraction()
@@ -903,9 +1050,26 @@ const cancelEdit = (card) => {
   card._backup = null
 }
 
-const removeManualCard = (card) => {
+const revokeCard = async (card) => {
+  if (!currentReport.value) return
+  try {
+    await ElMessageBox.confirm(
+      '撤销后将删除当前纠错卡片，是否继续？',
+      '撤销确认',
+      { confirmButtonText: '确认撤销', cancelButtonText: '返回', type: 'warning' }
+    )
+  } catch (_e) {
+    return
+  }
+
+  if (card.kind === 'pre' || card.origin_kind === 'pre') {
+    markPreCardDismissed(currentReport.value.id, card)
+  }
   cards.value = cards.value.filter((item) => item.id !== card.id)
-  autoSaveAfterInteraction()
+  if (selectedCardId.value === card.id) {
+    selectedCardId.value = cards.value[0]?.id || null
+  }
+  await autoSaveAfterInteraction()
 }
 
 const confirmPreCard = async (card) => {
@@ -914,6 +1078,9 @@ const confirmPreCard = async (card) => {
     allowAutoSuggestionWhenEmpty: true
   })
   if (!canSave) return
+  card.kind = 'manual'
+  card.origin_kind = 'pre'
+  unmarkPreCardDismissed(currentReport.value?.id, card)
   card.state = 'saved'
   card._backup = null
   await autoSaveAfterInteraction()
@@ -975,6 +1142,7 @@ const createManualCardFromSelection = () => {
   const newCard = {
     id: `manual-${currentReport.value.id}-${now}`,
     kind: 'manual',
+    origin_kind: 'manual',
     state: 'editing',
     content_type: field,
     source: selectedText,
@@ -990,6 +1158,7 @@ const createManualCardFromSelection = () => {
 
   cards.value.push(newCard)
   selectedCardId.value = newCard.id
+  scrollToCard(newCard.id)
 }
 
 const remindUnsubmitted = async (offset = 1) => {
@@ -1090,6 +1259,9 @@ const autoConfirmPendingPreCards = async () => {
       showValidationDialog: false,
       allowAutoSuggestionWhenEmpty: true
     })
+    card.kind = 'manual'
+    card.origin_kind = 'pre'
+    unmarkPreCardDismissed(currentReport.value?.id, card)
     card.state = 'saved'
     card._backup = null
   }
@@ -1191,6 +1363,10 @@ const handleOnlyMineChange = async (value) => {
   await loadReports()
 }
 
+onBeforeUnmount(() => {
+  clearHighlightFocus()
+})
+
 onMounted(async () => {
   try {
     const storedColumns = localStorage.getItem(TASK_COLUMNS_STORAGE_KEY)
@@ -1200,6 +1376,7 @@ onMounted(async () => {
       const clean = Array.isArray(parsed) ? parsed.filter((key) => allowed.has(key)) : []
       if (clean.length) visibleColumnKeys.value = clean
     }
+    restoreDismissedPreCardKeys()
 
     currentUser.value = await api.getMe()
     if (props.isAdminMode) {
@@ -1398,6 +1575,11 @@ onMounted(async () => {
   border: 1px dashed #f59e0b;
 }
 
+.section-content :deep(.hl-chip.hl-focus) {
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.45);
+  animation: chip-focus-pulse 0.8s ease-in-out 2;
+}
+
 .section-content :deep(.hl-prompt-triangle) {
   display: inline-flex;
   align-items: center;
@@ -1427,6 +1609,12 @@ onMounted(async () => {
   background: #ef4444;
 }
 
+@keyframes chip-focus-pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
 .right-panel {
   display: flex;
   flex-direction: column;
@@ -1446,11 +1634,12 @@ onMounted(async () => {
 .error-card {
   margin-bottom: 10px;
   border: 1px solid #e5e7eb;
-  cursor: default;
+  cursor: pointer;
 }
 
 .error-card.selected {
   border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
 }
 
 .card-head {
@@ -1494,6 +1683,12 @@ onMounted(async () => {
   margin-bottom: 8px;
 }
 
+.level-title {
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
 .severity-group :deep(.el-button) {
   width: 33.33%;
 }
@@ -1502,6 +1697,10 @@ onMounted(async () => {
   margin-top: 8px;
   display: flex;
   gap: 8px;
+}
+
+.revoke-btn {
+  margin-left: auto;
 }
 
 </style>
