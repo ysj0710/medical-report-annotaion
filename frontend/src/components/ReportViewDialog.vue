@@ -157,6 +157,15 @@ const normalizeContentType = (contentType) => {
   return CONTENT_TYPE_MAP[lower] || CONTENT_TYPE_MAP[raw] || ''
 }
 
+const normalizeAlertType = (value) => {
+  const text = String(value ?? '').trim()
+  const matched = text.match(/^(-?\d+)\.0+$/)
+  if (matched) {
+    return matched[1]
+  }
+  return text
+}
+
 const getDisplayAnnotations = () => {
   const doctorItems = props.report?.annotation_data?.error_items || []
   if (doctorItems.length > 0) {
@@ -167,7 +176,7 @@ const getDisplayAnnotations = () => {
         err_type: item.error_type || '',
         source: item.evidence_text || anchor.source || '',
         target: item.suggestion || anchor.target || '',
-        alert_type: String(anchor.alert_type ?? (item.suggestion ? '2' : '3')),
+        alert_type: normalizeAlertType(anchor.alert_type ?? (item.suggestion ? '2' : '0')),
         alert_message: item.description || '',
         alert_msg: item.description || '',
         source_in_start: anchor.source_in_start,
@@ -179,18 +188,19 @@ const getDisplayAnnotations = () => {
 }
 
 const inferActionByAnno = (anno) => {
-  const alertType = String(anno.alert_type ?? '').trim()
+  const alertType = normalizeAlertType(anno.alert_type)
   const source = String(anno.source || '')
   const target = String(anno.target || '')
   const message = String(anno.alert_message || anno.alert_msg || '')
 
+  if (alertType === '0') return 'prompt'
   if (alertType === '1') return 'delete'
-  if (alertType === '3') return 'prompt'
   if (target.trim()) return 'replace'
+  if (alertType === '2') return 'replace'
   if (/删除|删去|去掉|移除/.test(`${source}${message}`)) return 'delete'
   if (/提示|注意|建议|复查|随访/.test(`${source}${message}`)) return 'prompt'
   if (String(anno.err_type || '') === 'organectomys') return 'delete'
-  return 'replace'
+  return 'prompt'
 }
 
 const resolveHighlightRange = (text, anno) => {
@@ -262,7 +272,7 @@ const getHighlightedText = (field) => {
 
   for (const item of matchedAnnos) {
     const anno = item.anno
-    const alertType = anno.alert_type || ''
+    const alertType = normalizeAlertType(anno.alert_type)
     const alertMsg = anno.alert_message || anno.alert_msg || ''
     const errType = ERR_TYPE_MAP[anno.err_type] || anno.err_type || '错误'
     const start = item.start

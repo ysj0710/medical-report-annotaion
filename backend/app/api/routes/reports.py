@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import re
 from typing import Optional, List
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Response
@@ -100,6 +101,13 @@ def normalize_identifier(value: Optional[str]) -> str:
     return text
 
 
+def normalize_alert_type_text(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"-?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
 def normalize_columns(df: pd.DataFrame) -> dict:
     """标准化列名，返回映射后的数据"""
     records = []
@@ -195,7 +203,10 @@ def parse_pre_annotation_file(content: bytes, filename: str) -> dict:
         for col, mapped_col in PRE_ANNOTATION_COLUMNS.items():
             value = get_row_value(row, col)
             if pd.notna(value):
-                annotation[mapped_col] = str(value).strip()
+                text = str(value).strip()
+                if mapped_col == "alert_type":
+                    text = normalize_alert_type_text(text)
+                annotation[mapped_col] = text
 
         # 兼容 ALERT_MESSAGE 字段名
         alert_message = get_row_value(row, "ALERT_MESSAGE", "ALERT_MSG", "提示信息")
@@ -673,14 +684,22 @@ def export_all_reports(
         return "description"
 
     def infer_alert_type(anchor: dict, suggestion: str, message: str) -> str:
-        alert_type = str((anchor or {}).get("alert_type") or "").strip()
-        if alert_type in {"1", "2", "3"}:
+        action = str((anchor or {}).get("action") or "").strip().lower()
+        if action == "prompt":
+            return "0"
+        if action == "delete":
+            return "1"
+        if action == "replace":
+            return "2"
+
+        alert_type = normalize_alert_type_text((anchor or {}).get("alert_type"))
+        if alert_type in {"0", "1", "2"}:
             return alert_type
         if str(suggestion or "").strip():
             return "2"
         if any(k in str(message or "") for k in ["删除", "删去", "移除", "不应存在"]):
             return "1"
-        return "3"
+        return "0"
 
     report_columns = [
         "RIS_NO", "MODALITY", "PATIENT_SEX", "PATIENT_AGE",
@@ -740,10 +759,8 @@ def export_all_reports(
             start_text = str(start) if start is not None else ""
             end_text = str(end) if end is not None else ""
             raw_alert_type = pre.get("alert_type")
-            alert_type = str(raw_alert_type).strip() if raw_alert_type is not None else ""
+            alert_type = normalize_alert_type_text(raw_alert_type)
             # 原始预标注表要求与上传文件一致，这里不做类型推断映射。
-            if alert_type.endswith(".0") and alert_type[:-2].lstrip("-").isdigit():
-                alert_type = alert_type[:-2]
             original_pre_annotation_rows.append({
                 "RIS_NO": report.ris_no or "",
                 "CONTENT_TYPE": normalize_content_type(pre.get("content_type")),

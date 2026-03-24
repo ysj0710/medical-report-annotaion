@@ -362,6 +362,15 @@ const normalizeIdText = (value) => {
   return text.endsWith('.0') ? text.slice(0, -2) : text
 }
 
+const normalizeAlertType = (value) => {
+  const text = String(value ?? '').trim()
+  const matched = text.match(/^(-?\d+)\.0+$/)
+  if (matched) {
+    return matched[1]
+  }
+  return text
+}
+
 const riskByErrorType = (errorType) => {
   if (['sexs', 'typos', 'typoTerms'].includes(errorType)) return 'low'
   if (['bodyParts', 'examitems', 'typo_modality'].includes(errorType)) return 'medium'
@@ -407,7 +416,7 @@ const getCardSuggestionText = (card) => {
 }
 
 const inferActionByCard = (card) => {
-  const alertType = String(card.alert_type ?? '').trim()
+  const alertType = normalizeAlertType(card.alert_type)
   const source = String(card.source || '').trim()
   const target = String(card.target || '').trim()
   const messageRaw = String(card.alert_message || '').trim()
@@ -423,7 +432,7 @@ const inferActionByCard = (card) => {
     card.error_type === 'typo_modality' ||
     /不匹配|不符|请确认|需确认|建议核对|核对/.test(messageRaw)
   ) return 'prompt'
-  if (alertType === '3') return 'prompt'
+  if (alertType === '0') return 'prompt'
   if (target && target !== source) return 'replace'
   if (alertType === '2') return 'replace'
   if (/删除|删去|去掉|移除|多余|不应存在|应删除/.test(`${source}${messageRaw}`)) return 'delete'
@@ -435,7 +444,7 @@ const inferActionByCard = (card) => {
 
 const syncActionToAlertType = (card) => {
   card.action = normalizeAction(card.action || inferActionByCard(card))
-  const map = { replace: '2', delete: '1', prompt: '3' }
+  const map = { replace: '2', delete: '1', prompt: '0' }
   card.alert_type = map[card.action]
 }
 
