@@ -19,6 +19,7 @@
           <el-option value="" label="全部状态" />
           <el-option value="IMPORTED" label="待分发" />
           <el-option value="ASSIGNED" label="已分发" />
+          <el-option value="IN_PROGRESS" label="标注中" />
           <el-option value="SUBMITTED" label="已提交" />
           <el-option value="REVIEW_ASSIGNED" label="待复核" />
           <el-option value="REVIEW_IN_PROGRESS" label="复核中" />
