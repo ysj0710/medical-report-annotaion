@@ -154,6 +154,7 @@ PRE_ANNOTATION_COLUMNS = {
     "SOURCE": "source",
     "TARGET": "target",
     "ALERT_TYPE": "alert_type",
+    "ALTER_TYPE": "alert_type",
     "ALERT_MSG": "alert_msg",
     "SOURCE_IN_START": "source_in_start",
     "SOURCE_IN_END": "source_in_end",
@@ -738,9 +739,11 @@ def export_all_reports(
             end = pre.get("source_in_end")
             start_text = str(start) if start is not None else ""
             end_text = str(end) if end is not None else ""
-            alert_type = str(pre.get("alert_type") or "").strip()
-            if alert_type not in {"1", "2", "3"}:
-                alert_type = infer_alert_type({"alert_type": pre.get("alert_type")}, target, message)
+            raw_alert_type = pre.get("alert_type")
+            alert_type = str(raw_alert_type).strip() if raw_alert_type is not None else ""
+            # 原始预标注表要求与上传文件一致，这里不做类型推断映射。
+            if alert_type.endswith(".0") and alert_type[:-2].lstrip("-").isdigit():
+                alert_type = alert_type[:-2]
             original_pre_annotation_rows.append({
                 "RIS_NO": report.ris_no or "",
                 "CONTENT_TYPE": normalize_content_type(pre.get("content_type")),
