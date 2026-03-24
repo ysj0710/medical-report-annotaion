@@ -145,6 +145,12 @@ def get_doctor_report(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
+    # 复核员打开待复核报告即进入“复核中”
+    if report.status == STATUS_REVIEW_ASSIGNED and report.assigned_doctor_id == current_user.id:
+        report.status = STATUS_REVIEW_IN_PROGRESS
+        db.commit()
+        db.refresh(report)
+
     annotation = db.query(Annotation).filter(Annotation.report_id == report_id).first()
 
     return DoctorReportResponse(

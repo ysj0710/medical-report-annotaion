@@ -957,6 +957,10 @@ const buildCardAnchorKey = (card) => {
 const openReport = async (report) => {
   const detail = await api.getDoctorReport(report.id)
   currentReport.value = detail
+  const row = reportList.value.find((item) => item.id === report.id)
+  if (row) {
+    row.status = detail.status
+  }
 
   const preCards = buildPreCards(detail)
   const manualCards = buildManualCardsFromAnnotation(detail)
