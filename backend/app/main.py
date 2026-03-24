@@ -58,6 +58,30 @@ async def lifespan(app: FastAPI):
                 conn.execute(text("ALTER TABLE reports ADD COLUMN is_cancel BOOLEAN DEFAULT FALSE"))
                 conn.commit()
             print("Added is_cancel column to reports table")
+
+        if 'annotator_doctor_id' not in report_columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN annotator_doctor_id INTEGER"))
+                conn.commit()
+            print("Added annotator_doctor_id column to reports table")
+
+        if 'reviewer_doctor_id' not in report_columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN reviewer_doctor_id INTEGER"))
+                conn.commit()
+            print("Added reviewer_doctor_id column to reports table")
+
+        if 'review_assigned_at' not in report_columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN review_assigned_at TIMESTAMPTZ"))
+                conn.commit()
+            print("Added review_assigned_at column to reports table")
+
+        if 'reviewed_at' not in report_columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN reviewed_at TIMESTAMPTZ"))
+                conn.commit()
+            print("Added reviewed_at column to reports table")
     except Exception as e:
         print(f"Database migration warning: {e}")
     finally:

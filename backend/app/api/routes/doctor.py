@@ -17,6 +17,8 @@ router = APIRouter()
 STATUS_ASSIGNED = "ASSIGNED"
 STATUS_IN_PROGRESS = "IN_PROGRESS"
 STATUS_SUBMITTED = "SUBMITTED"
+STATUS_REVIEW_ASSIGNED = "REVIEW_ASSIGNED"
+STATUS_REVIEW_IN_PROGRESS = "REVIEW_IN_PROGRESS"
 STATUS_DONE = "DONE"
 
 
@@ -48,7 +50,7 @@ def list_doctor_reports(
 
     # 按 tab 筛选状态
     if tab == "unannotated":
-        query = query.filter(Report.status.in_([STATUS_ASSIGNED, STATUS_IN_PROGRESS]))
+        query = query.filter(Report.status.in_([STATUS_ASSIGNED, STATUS_IN_PROGRESS, STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS]))
     elif tab == "annotated":
         query = query.filter(Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]))
     elif tab == "no_error":
@@ -68,8 +70,6 @@ def list_doctor_reports(
     items = []
     for report in all_reports:
         annotation_query = db.query(Annotation).filter(Annotation.report_id == report.id)
-        if current_user.role != "admin":
-            annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
         annotation = annotation_query.first()
 
         # tab == no_error 时过滤
@@ -95,6 +95,10 @@ def list_doctor_reports(
             status=report.status,
             assigned_doctor_id=report.assigned_doctor_id,
             assigned_at=report.assigned_at,
+            annotator_doctor_id=report.annotator_doctor_id,
+            reviewer_doctor_id=report.reviewer_doctor_id,
+            review_assigned_at=report.review_assigned_at,
+            reviewed_at=report.reviewed_at,
             submitted_at=report.submitted_at,
             pre_annotations=report.pre_annotations,
             annotation=annotation
@@ -141,10 +145,7 @@ def get_doctor_report(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    annotation_query = db.query(Annotation).filter(Annotation.report_id == report_id)
-    if current_user.role != "admin":
-        annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
-    annotation = annotation_query.first()
+    annotation = db.query(Annotation).filter(Annotation.report_id == report_id).first()
 
     return DoctorReportResponse(
         id=report.id,
@@ -164,6 +165,10 @@ def get_doctor_report(
         status=report.status,
         assigned_doctor_id=report.assigned_doctor_id,
         assigned_at=report.assigned_at,
+        annotator_doctor_id=report.annotator_doctor_id,
+        reviewer_doctor_id=report.reviewer_doctor_id,
+        review_assigned_at=report.review_assigned_at,
+        reviewed_at=report.reviewed_at,
         submitted_at=report.submitted_at,
         pre_annotations=report.pre_annotations,
         annotation=annotation
@@ -189,16 +194,13 @@ def save_draft(
         ).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    if report.status == STATUS_SUBMITTED:
+    if report.status in [STATUS_SUBMITTED, STATUS_DONE]:
         raise HTTPException(status_code=400, detail="Already submitted")
 
     now = datetime.utcnow()
 
     # 查找或创建标注
-    annotation_query = db.query(Annotation).filter(Annotation.report_id == report_id)
-    if current_user.role != "admin":
-        annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
-    annotation = annotation_query.first()
+    annotation = db.query(Annotation).filter(Annotation.report_id == report_id).first()
 
     if not annotation:
         annotation_owner_id = report.assigned_doctor_id or current_user.id
@@ -216,6 +218,8 @@ def save_draft(
     # 更新报告状态
     if report.status == STATUS_ASSIGNED:
         report.status = STATUS_IN_PROGRESS
+    elif report.status == STATUS_REVIEW_ASSIGNED:
+        report.status = STATUS_REVIEW_IN_PROGRESS
 
     db.commit()
     db.refresh(annotation)
@@ -242,19 +246,20 @@ def submit_annotation(
         ).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    if report.status == STATUS_SUBMITTED:
+    if report.status == STATUS_DONE:
+        raise HTTPException(status_code=400, detail="Already done")
+
+    is_review_mode = report.status in [STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS]
+    if report.status == STATUS_SUBMITTED and not is_review_mode:
         raise HTTPException(status_code=400, detail="Already submitted")
 
     now = datetime.utcnow()
 
     # 查找或创建标注
-    annotation_query = db.query(Annotation).filter(Annotation.report_id == report_id)
-    if current_user.role != "admin":
-        annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
-    annotation = annotation_query.first()
+    annotation = db.query(Annotation).filter(Annotation.report_id == report_id).first()
 
     if not annotation:
-        annotation_owner_id = report.assigned_doctor_id or current_user.id
+        annotation_owner_id = report.annotator_doctor_id or report.assigned_doctor_id or current_user.id
         annotation = Annotation(
             report_id=report_id,
             doctor_id=annotation_owner_id
@@ -267,14 +272,23 @@ def submit_annotation(
     annotation.submitted_at = now
 
     # 更新报告状态
-    report.status = STATUS_SUBMITTED
-    report.submitted_at = now
+    if is_review_mode:
+        report.status = STATUS_DONE
+        report.reviewed_at = now
+        if not report.reviewer_doctor_id:
+            report.reviewer_doctor_id = current_user.id
+    else:
+        report.status = STATUS_SUBMITTED
+        report.submitted_at = now
+        if not report.annotator_doctor_id:
+            report.annotator_doctor_id = current_user.id
 
     # 查找下一个报告
+    next_statuses = [STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS] if is_review_mode else [STATUS_ASSIGNED, STATUS_IN_PROGRESS]
     next_report_query = db.query(Report).filter(
         Report.id != report_id,
         Report.is_cancel == False,
-        Report.status.in_([STATUS_ASSIGNED, STATUS_IN_PROGRESS])
+        Report.status.in_(next_statuses)
     )
     if current_user.role != "admin":
         next_report_query = next_report_query.filter(Report.assigned_doctor_id == current_user.id)
@@ -307,16 +321,17 @@ def cancel_annotation(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    annotation_query = db.query(Annotation).filter(Annotation.report_id == report_id)
-    if current_user.role != "admin":
-        annotation_query = annotation_query.filter(Annotation.doctor_id == current_user.id)
-    annotation = annotation_query.first()
+    annotation = db.query(Annotation).filter(Annotation.report_id == report_id).first()
 
     if annotation:
         annotation.status = "DRAFT"
         annotation.submitted_at = None
 
-    report.status = STATUS_IN_PROGRESS if annotation else STATUS_ASSIGNED
-    report.submitted_at = None
+    if report.status == STATUS_REVIEW_ASSIGNED:
+        report.status = STATUS_REVIEW_IN_PROGRESS
+        report.reviewed_at = None
+    else:
+        report.status = STATUS_IN_PROGRESS if annotation else STATUS_ASSIGNED
+        report.submitted_at = None
     db.commit()
     return {"ok": True}

@@ -20,6 +20,8 @@
           <el-option value="IMPORTED" label="待分发" />
           <el-option value="ASSIGNED" label="已分发" />
           <el-option value="SUBMITTED" label="已提交" />
+          <el-option value="REVIEW_ASSIGNED" label="待复核" />
+          <el-option value="REVIEW_IN_PROGRESS" label="复核中" />
           <el-option value="DONE" label="已完成" />
         </el-select>
         <el-button @click="loadReports">查询</el-button>
@@ -70,6 +72,7 @@
           show-overflow-tooltip
         />
         <el-table-column label="标注员" prop="doctor_username" width="100" />
+        <el-table-column label="复核员" prop="reviewer_username" width="100" />
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <el-tag :type="getStatusType(row.status)">{{
@@ -252,7 +255,7 @@
 
     <!-- 分发弹窗 -->
     <el-dialog v-model="showAssignModal" title="分发报告给医生" width="760px">
-      <p>将自动分发全部可分配报告（待分发 + 未编辑的已分发）</p>
+      <p>系统会自动优先分发待标注报告；若无可分配标注任务，则自动分发已提交报告进入复核。</p>
       <el-transfer
         v-model="assignDoctorIds"
         :data="doctorTransferData"
@@ -488,19 +491,20 @@ const pollTask = async (taskId) => {
 const handleAssign = async () => {
   try {
     const doctorMap = new Map(doctors.value.map((doctor) => [doctor.id, doctor.username]));
-    const res = await api.assignReports([], null, assignDoctorIds.value);
+    const res = await api.assignReports([], null, assignDoctorIds.value, "auto");
     if (!res.assigned) {
-      ElMessage.warning("没有可分配的报告（仅支持待分发/已分发状态）");
+      ElMessage.warning("没有可分配的报告");
       return;
     }
+    const modeText = res.mode === "review" ? "复核分发" : "标注分发";
     const perDoctorText = Object.entries(res.per_doctor || {})
       .filter(([, count]) => count > 0)
       .map(([doctorId, count]) => `${doctorMap.get(Number(doctorId)) || doctorId}：${count}条`)
       .join("；");
     ElMessage.success(
       perDoctorText
-        ? `分发成功，共 ${res.assigned} 条。${perDoctorText}`
-        : `分发成功，共 ${res.assigned} 条`,
+        ? `${modeText}成功，共 ${res.assigned} 条。${perDoctorText}`
+        : `${modeText}成功，共 ${res.assigned} 条`,
     );
     showAssignModal.value = false;
     selectedReports.value = [];
@@ -704,8 +708,8 @@ const getStatusText = (status) => {
     ASSIGNED: "已分发",
     IN_PROGRESS: "标注中",
     SUBMITTED: "已提交",
-    REVIEW_PENDING: "待复核",
-    REJECTED: "已驳回",
+    REVIEW_ASSIGNED: "待复核",
+    REVIEW_IN_PROGRESS: "复核中",
     DONE: "已完成",
   };
   return statusMap[status] || status;
@@ -717,8 +721,8 @@ const getStatusType = (status) => {
     ASSIGNED: "primary", // 蓝色 - 已分发
     IN_PROGRESS: "warning", // 橙色 - 标注中
     SUBMITTED: "warning", // 黄色 - 已提交
-    REVIEW_PENDING: "warning", // 黄色 - 待复核
-    REJECTED: "danger", // 红色 - 已驳回
+    REVIEW_ASSIGNED: "warning", // 黄色 - 待复核
+    REVIEW_IN_PROGRESS: "warning", // 黄色 - 复核中
     DONE: "primary", // 蓝色 - 已完成
   };
   return typeMap[status] || "";

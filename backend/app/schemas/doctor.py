@@ -50,6 +50,10 @@ class DoctorReportResponse(BaseModel):
     status: str
     assigned_doctor_id: Optional[int] = None
     assigned_at: Optional[datetime]
+    annotator_doctor_id: Optional[int] = None
+    reviewer_doctor_id: Optional[int] = None
+    review_assigned_at: Optional[datetime] = None
+    reviewed_at: Optional[datetime] = None
     submitted_at: Optional[datetime]
     pre_annotations: Optional[List[Any]] = None  # 预标注错误列表
     annotation: Optional[AnnotationResponse] = None

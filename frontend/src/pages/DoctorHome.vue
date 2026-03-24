@@ -100,9 +100,9 @@
           <el-checkbox v-model="autoGoNextAfterSubmit" class="auto-next-toggle">完成之后自动进入下一个</el-checkbox>
           <el-button @click="goPrevReport">上一个</el-button>
           <el-button @click="goNextReport">下一个</el-button>
-          <el-button type="primary" @click="createManualCardFromSelection" :disabled="isReportAnnotated">标注选中文本</el-button>
-          <el-button type="success" @click="submitReport" :loading="submitting" :disabled="isReportAnnotated">完成标注</el-button>
-          <el-button v-if="isReportAnnotated" type="danger" plain @click="cancelSubmittedAnnotation">取消标注</el-button>
+          <el-button type="primary" @click="createManualCardFromSelection" :disabled="isEditingLocked">标注选中文本</el-button>
+          <el-button type="success" @click="submitReport" :loading="submitting" :disabled="!canSubmitCurrentReport">{{ submitButtonText }}</el-button>
+          <el-button v-if="showCancelAnnotationButton" type="danger" plain @click="cancelSubmittedAnnotation">取消标注</el-button>
         </div>
       </div>
 
@@ -188,16 +188,16 @@
 
           <div class="card-actions">
             <template v-if="card.kind === 'pre'">
-              <el-button v-if="card.state === 'pending'" size="small" type="success" @click.stop="confirmPreCard(card)" :disabled="isReportAnnotated">确认</el-button>
-              <el-button v-if="card.state === 'pending'" size="small" @click.stop="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
-              <el-button v-if="card.state === 'saved'" size="small" @click.stop="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click.stop="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
+              <el-button v-if="card.state === 'pending'" size="small" type="success" @click.stop="confirmPreCard(card)" :disabled="isEditingLocked">确认</el-button>
+              <el-button v-if="card.state === 'pending'" size="small" @click.stop="editCard(card)" :disabled="isEditingLocked">修改</el-button>
+              <el-button v-if="card.state === 'saved'" size="small" @click.stop="editCard(card)" :disabled="isEditingLocked">修改</el-button>
+              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click.stop="saveCard(card)" :disabled="isEditingLocked">保存</el-button>
               <el-button v-if="card.state === 'editing'" size="small" @click.stop="cancelEdit(card)">取消</el-button>
             </template>
 
             <template v-else>
-              <el-button v-if="card.state !== 'editing'" size="small" @click.stop="editCard(card)" :disabled="isReportAnnotated">修改</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click.stop="saveCard(card)" :disabled="isReportAnnotated">保存</el-button>
+              <el-button v-if="card.state !== 'editing'" size="small" @click.stop="editCard(card)" :disabled="isEditingLocked">修改</el-button>
+              <el-button v-if="card.state === 'editing'" size="small" type="primary" @click.stop="saveCard(card)" :disabled="isEditingLocked">保存</el-button>
               <el-button v-if="card.state === 'editing'" size="small" @click.stop="cancelEdit(card)">取消</el-button>
             </template>
             <el-button
@@ -206,7 +206,7 @@
               plain
               class="revoke-btn"
               @click.stop="revokeCard(card)"
-              :disabled="isReportAnnotated"
+              :disabled="isEditingLocked"
             >
               撤销
             </el-button>
@@ -297,7 +297,25 @@ const progressPercent = computed(() => {
   return Math.round((progress.value.done / progress.value.total) * 100)
 })
 
-const isReportAnnotated = computed(() => isAnnotated(currentReport.value?.status))
+const isEditingLockedStatus = (status) => ['SUBMITTED', 'DONE', 'REVIEW_ASSIGNED'].includes(status || '')
+const canSubmitStatus = (status) => ['ASSIGNED', 'IN_PROGRESS', 'REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS'].includes(status || '')
+const isDraftWorkflowStatus = (status) => ['ASSIGNED', 'IN_PROGRESS', 'REVIEW_IN_PROGRESS'].includes(status || '')
+
+const isEditingLocked = computed(() => isEditingLockedStatus(currentReport.value?.status))
+const canSubmitCurrentReport = computed(() => {
+  if (!currentReport.value) return false
+  return canSubmitStatus(currentReport.value.status)
+})
+const showCancelAnnotationButton = computed(() => {
+  const status = currentReport.value?.status
+  return status === 'SUBMITTED' || status === 'REVIEW_ASSIGNED'
+})
+const submitButtonText = computed(() => {
+  const status = currentReport.value?.status
+  if (status === 'REVIEW_ASSIGNED') return '确认无误'
+  if (status === 'REVIEW_IN_PROGRESS') return '完成标注核验'
+  return '完成标注'
+})
 const currentReportIndex = computed(() => {
   if (!currentReport.value) return -1
   return reportList.value.findIndex((item) => item.id === currentReport.value.id)
@@ -319,6 +337,8 @@ const getStatusText = (status) => {
     ASSIGNED: '未标注',
     IN_PROGRESS: '未标注',
     SUBMITTED: '已标注',
+    REVIEW_ASSIGNED: '待复核',
+    REVIEW_IN_PROGRESS: '复核中',
     DONE: '已标注'
   }
   return map[status] || status
@@ -326,7 +346,7 @@ const getStatusText = (status) => {
 
 const getStatusType = (status) => {
   if (status === 'SUBMITTED' || status === 'DONE') return 'success'
-  if (status === 'IN_PROGRESS') return 'warning'
+  if (status === 'IN_PROGRESS' || status === 'REVIEW_ASSIGNED' || status === 'REVIEW_IN_PROGRESS') return 'warning'
   return 'info'
 }
 
@@ -959,7 +979,7 @@ const updateCurrentReportStatusLocally = (status) => {
 }
 
 const autoSaveAfterInteraction = async () => {
-  if (!currentReport.value || isReportAnnotated.value) return
+  if (!currentReport.value || isEditingLocked.value) return
   if (autoSaving.value) {
     autoSavePending.value = true
     return
@@ -1171,14 +1191,15 @@ const createManualCardFromSelection = () => {
 }
 
 const remindUnsubmitted = async (offset = 1) => {
-  if (!currentReport.value || isReportAnnotated.value) return 'pass'
+  if (!currentReport.value || !isDraftWorkflowStatus(currentReport.value.status)) return 'pass'
   const directionText = offset < 0 ? '上一份' : '下一份'
+  const submitText = submitButtonText.value
   try {
     await ElMessageBox.confirm(
-      `该报告已暂存，暂未确认标注完成。你可以立即确认完成标注，或继续查看${directionText}报告。`,
+      `该报告已暂存，暂未确认提交。你可以立即${submitText}，或继续查看${directionText}报告。`,
       '切换提示',
       {
-        confirmButtonText: '立即确认完成标注',
+        confirmButtonText: `立即${submitText}`,
         cancelButtonText: `仍要查看${directionText}报告`,
         distinguishCancelAndClose: true,
         closeOnClickModal: false,
@@ -1204,12 +1225,13 @@ const switchReportByOffset = async (offset) => {
   const targetIdx = (baseIdx + offset + total) % total
   const fallbackTargetId = reportList.value[targetIdx]?.id
 
-  if (intent === 'submit' && currentReport.value && !isReportAnnotated.value) {
+  if (intent === 'submit' && currentReport.value && canSubmitStatus(currentReport.value.status)) {
     const canSubmit = await ensurePreCardsReadyBeforeSubmit()
     if (!canSubmit) return
     try {
       await api.submitAnnotation(currentReport.value.id, buildPayload())
-      updateCurrentReportStatusLocally('SUBMITTED')
+      const nextStatus = currentReport.value.status === 'REVIEW_IN_PROGRESS' ? 'DONE' : 'SUBMITTED'
+      updateCurrentReportStatusLocally(nextStatus)
       await loadReports()
     } catch (e) {
       ElMessage.error(e.message || '完成标注失败，未切换报告')
@@ -1277,6 +1299,7 @@ const autoConfirmPendingPreCards = async () => {
 }
 
 const ensurePreCardsReadyBeforeSubmit = async () => {
+  if (currentReport.value?.status === 'REVIEW_ASSIGNED') return true
   const pendingPreCount = cards.value.filter((card) => card.kind === 'pre' && card.state === 'pending').length
   if (pendingPreCount <= 0) return true
 
@@ -1298,7 +1321,7 @@ const ensurePreCardsReadyBeforeSubmit = async () => {
 }
 
 const submitReport = async () => {
-  if (!currentReport.value || isReportAnnotated.value) return
+  if (!currentReport.value || !canSubmitCurrentReport.value) return
   const canSubmit = await ensurePreCardsReadyBeforeSubmit()
   if (!canSubmit) return
 
@@ -1307,7 +1330,7 @@ const submitReport = async () => {
   submitting.value = true
   try {
     await api.submitAnnotation(currentReport.value.id, buildPayload())
-    ElMessage.success('标注完成')
+    ElMessage.success(submitButtonText.value)
     await loadReports()
 
     const offset = autoGoNextAfterSubmit.value ? 1 : 0
@@ -1325,12 +1348,20 @@ const submitReport = async () => {
 }
 
 const cancelSubmittedAnnotation = async () => {
-  if (!currentReport.value || !isReportAnnotated.value) return
+  if (!currentReport.value || !showCancelAnnotationButton.value) return
   const reportId = currentReport.value.id
+  const isReviewTask = currentReport.value.status === 'REVIEW_ASSIGNED'
+  const confirmText = isReviewTask
+    ? '确认后将进入复核修改状态，是否继续？'
+    : '取消后，当前报告将回到待标注状态，是否继续？'
+  const titleText = isReviewTask ? '开始复核修改' : '取消标注确认'
+  const successText = isReviewTask
+    ? '已进入复核修改状态，请完成核验后提交'
+    : '已取消标注，当前报告已恢复为可编辑状态'
   try {
     await ElMessageBox.confirm(
-      '取消后，当前报告将回到待标注状态，是否继续？',
-      '取消标注确认',
+      confirmText,
+      titleText,
       {
         confirmButtonText: '确认取消',
         cancelButtonText: '返回',
@@ -1338,7 +1369,7 @@ const cancelSubmittedAnnotation = async () => {
       }
     )
     await api.cancelAnnotation(reportId)
-    ElMessage.success('已取消标注，当前报告已恢复为可编辑状态')
+    ElMessage.success(successText)
     await loadReports()
     const refreshed = reportList.value.find((item) => item.id === reportId)
     if (refreshed) {

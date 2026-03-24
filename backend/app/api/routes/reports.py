@@ -28,6 +28,8 @@ STATUS_IMPORTED = "IMPORTED"
 STATUS_ASSIGNED = "ASSIGNED"
 STATUS_IN_PROGRESS = "IN_PROGRESS"
 STATUS_SUBMITTED = "SUBMITTED"
+STATUS_REVIEW_ASSIGNED = "REVIEW_ASSIGNED"
+STATUS_REVIEW_IN_PROGRESS = "REVIEW_IN_PROGRESS"
 STATUS_DONE = "DONE"
 
 # 导入任务状态
@@ -432,6 +434,7 @@ def list_reports(
     result_items = []
     for item in items:
         annotation = db.query(Annotation).filter(Annotation.report_id == item.id).first()
+        annotator_id = item.annotator_doctor_id or (annotation.doctor_id if annotation else None)
         item_dict = {
             'id': item.id,
             'external_id': item.external_id,
@@ -442,6 +445,10 @@ def list_reports(
             'imported_at': item.imported_at,
             'assigned_doctor_id': item.assigned_doctor_id,
             'assigned_at': item.assigned_at,
+            'annotator_doctor_id': annotator_id,
+            'reviewer_doctor_id': item.reviewer_doctor_id,
+            'review_assigned_at': item.review_assigned_at,
+            'reviewed_at': item.reviewed_at,
             'submitted_at': item.submitted_at,
             'modality': item.modality,
             'patient_name': item.patient_name,
@@ -455,15 +462,22 @@ def list_reports(
             'pre_annotations': item.pre_annotations,
             'doctor_employee_id': None,
             'doctor_username': None,
+            'reviewer_employee_id': None,
+            'reviewer_username': None,
             'annotation_data': annotation.data if annotation else None,
             'annotation_status': annotation.status if annotation else None,
             'annotation_submitted_at': annotation.submitted_at if annotation else None,
         }
-        if item.assigned_doctor_id:
-            doctor = db.query(User).filter(User.id == item.assigned_doctor_id, User.is_cancel == False).first()
+        if annotator_id:
+            doctor = db.query(User).filter(User.id == annotator_id, User.is_cancel == False).first()
             if doctor:
                 item_dict['doctor_employee_id'] = doctor.employee_id
                 item_dict['doctor_username'] = doctor.username
+        if item.reviewer_doctor_id:
+            reviewer = db.query(User).filter(User.id == item.reviewer_doctor_id, User.is_cancel == False).first()
+            if reviewer:
+                item_dict['reviewer_employee_id'] = reviewer.employee_id
+                item_dict['reviewer_username'] = reviewer.username
         result_items.append(item_dict)
 
     return ReportListResponse(
@@ -483,10 +497,14 @@ def get_report(
     report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    doctor = None
-    if report.assigned_doctor_id:
-        doctor = db.query(User).filter(User.id == report.assigned_doctor_id, User.is_cancel == False).first()
     annotation = db.query(Annotation).filter(Annotation.report_id == report.id).first()
+    annotator_id = report.annotator_doctor_id or (annotation.doctor_id if annotation else None)
+    doctor = None
+    reviewer = None
+    if annotator_id:
+        doctor = db.query(User).filter(User.id == annotator_id, User.is_cancel == False).first()
+    if report.reviewer_doctor_id:
+        reviewer = db.query(User).filter(User.id == report.reviewer_doctor_id, User.is_cancel == False).first()
 
     return {
         "id": report.id,
@@ -498,6 +516,10 @@ def get_report(
         "imported_at": report.imported_at,
         "assigned_doctor_id": report.assigned_doctor_id,
         "assigned_at": report.assigned_at,
+        "annotator_doctor_id": annotator_id,
+        "reviewer_doctor_id": report.reviewer_doctor_id,
+        "review_assigned_at": report.review_assigned_at,
+        "reviewed_at": report.reviewed_at,
         "submitted_at": report.submitted_at,
         "modality": report.modality,
         "patient_name": report.patient_name,
@@ -511,6 +533,8 @@ def get_report(
         "pre_annotations": report.pre_annotations,
         "doctor_employee_id": doctor.employee_id if doctor else None,
         "doctor_username": doctor.username if doctor else None,
+        "reviewer_employee_id": reviewer.employee_id if reviewer else None,
+        "reviewer_username": reviewer.username if reviewer else None,
         "annotation_data": annotation.data if annotation else None,
         "annotation_status": annotation.status if annotation else None,
         "annotation_submitted_at": annotation.submitted_at if annotation else None,
@@ -540,7 +564,11 @@ def assign_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    """分发报告给医生（支持二次分配；有编辑/提交痕迹的报告禁止二次分配）"""
+    """分发报告给医生。
+    mode=annotation: 首次标注分发
+    mode=review: 复核分发（仅已提交报告）
+    mode=auto: 优先首次分发，如无可分发项则执行复核分发
+    """
     selected_doctor_ids: List[int] = []
     if request.doctor_ids:
         selected_doctor_ids = [int(doctor_id) for doctor_id in request.doctor_ids]
@@ -562,11 +590,14 @@ def assign_reports(
     if len(doctors) != len(selected_doctor_ids):
         raise HTTPException(status_code=400, detail="医生不存在或已被禁用")
 
-    # 组装报告查询：
-    # 未传 report_ids 时默认分发全部可分配报告：
-    # 1) 待分发（IMPORTED）可分配
-    # 2) 已分发（ASSIGNED）仅在“无任何标注记录”时可二次分配
-    query = db.query(Report).outerjoin(
+    mode = str(request.mode or "auto").strip().lower()
+    if mode not in {"auto", "annotation", "review"}:
+        raise HTTPException(status_code=400, detail="mode 仅支持 auto / annotation / review")
+
+    # 首次标注可分配集合：
+    # 1) 待分发（IMPORTED）
+    # 2) 已分发（ASSIGNED）且尚无标注记录（允许覆盖分发）
+    annotation_query = db.query(Report).outerjoin(
         Annotation, Report.id == Annotation.report_id
     ).filter(
         Report.is_cancel == False,
@@ -575,13 +606,21 @@ def assign_reports(
             and_(Report.status == STATUS_ASSIGNED, Annotation.id.is_(None))
         )
     )
+
+    # 复核可分配集合：仅已提交
+    review_query = db.query(Report).filter(
+        Report.is_cancel == False,
+        Report.status == STATUS_SUBMITTED
+    )
+
     if request.report_ids:
-        query = query.filter(
+        annotation_query = annotation_query.filter(
             Report.id.in_(request.report_ids),
             Report.status.in_([STATUS_IMPORTED, STATUS_ASSIGNED])
         )
+        review_query = review_query.filter(Report.id.in_(request.report_ids))
 
-        # 显式点选分发时，若包含已开始编辑/已提交的报告，直接阻断并提示
+        # 显式点选首次分发时，若包含已开始编辑/已提交报告，直接阻断并提示
         locked_reports = db.query(Report.id).join(
             Annotation, Report.id == Annotation.report_id
         ).filter(
@@ -599,23 +638,82 @@ def assign_reports(
                 detail=f"以下报告已开始编辑或已提交，不能二次分发：{preview}"
             )
 
-    reports = query.order_by(Report.id.asc()).all()
+    annotation_reports = annotation_query.order_by(Report.id.asc()).all()
+    review_reports = review_query.order_by(Report.id.asc()).all()
+
+    selected_mode = "annotation"
+    reports = []
+    if mode == "annotation":
+        reports = annotation_reports
+    elif mode == "review":
+        reports = review_reports
+        selected_mode = "review"
+    else:
+        if annotation_reports:
+            reports = annotation_reports
+        else:
+            reports = review_reports
+            selected_mode = "review"
 
     if not reports:
-        return AssignResponse(assigned=0, per_doctor={})
+        return AssignResponse(assigned=0, per_doctor={}, mode=selected_mode)
 
     per_doctor: dict[str, int] = {str(doctor_id): 0 for doctor_id in selected_doctor_ids}
     now = datetime.utcnow()
 
-    for index, report in enumerate(reports):
-        doctor_id = selected_doctor_ids[index % len(selected_doctor_ids)]
-        report.assigned_doctor_id = doctor_id
-        report.assigned_at = now
-        report.status = STATUS_ASSIGNED
-        per_doctor[str(doctor_id)] += 1
+    if selected_mode == "annotation":
+        for index, report in enumerate(reports):
+            doctor_id = selected_doctor_ids[index % len(selected_doctor_ids)]
+            report.assigned_doctor_id = doctor_id
+            report.assigned_at = now
+            report.status = STATUS_ASSIGNED
+            report.annotator_doctor_id = doctor_id
+            report.reviewer_doctor_id = None
+            report.review_assigned_at = None
+            report.reviewed_at = None
+            per_doctor[str(doctor_id)] += 1
+    else:
+        start_idx = 0
+        impossible_reports: List[str] = []
+        for report in reports:
+            annotation = db.query(Annotation).filter(Annotation.report_id == report.id).first()
+            annotator_id = report.annotator_doctor_id or (annotation.doctor_id if annotation else None) or report.assigned_doctor_id
+            chosen_doctor_id = None
+            chosen_idx = None
+            for offset in range(len(selected_doctor_ids)):
+                idx = (start_idx + offset) % len(selected_doctor_ids)
+                candidate_doctor_id = selected_doctor_ids[idx]
+                if annotator_id and candidate_doctor_id == annotator_id:
+                    continue
+                chosen_doctor_id = candidate_doctor_id
+                chosen_idx = idx
+                break
+            if chosen_doctor_id is None:
+                impossible_reports.append(str(report.id))
+                continue
+
+            report.annotator_doctor_id = annotator_id
+            report.reviewer_doctor_id = chosen_doctor_id
+            report.review_assigned_at = now
+            report.reviewed_at = None
+            report.assigned_doctor_id = chosen_doctor_id
+            report.assigned_at = now
+            report.status = STATUS_REVIEW_ASSIGNED
+            per_doctor[str(chosen_doctor_id)] += 1
+            start_idx = (chosen_idx + 1) % len(selected_doctor_ids)
+
+        if impossible_reports:
+            preview = "、".join(impossible_reports[:20])
+            if len(impossible_reports) > 20:
+                preview += "……"
+            raise HTTPException(
+                status_code=400,
+                detail=f"以下报告无法分配复核（复核人与标注人不能相同）：{preview}"
+            )
 
     db.commit()
-    return AssignResponse(assigned=len(reports), per_doctor=per_doctor)
+    assigned_total = sum(per_doctor.values())
+    return AssignResponse(assigned=assigned_total, per_doctor=per_doctor, mode=selected_mode)
 
 
 # 导出 API 放在 reports 路由中

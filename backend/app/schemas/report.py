@@ -13,6 +13,10 @@ class ReportResponse(BaseModel):
     imported_at: Optional[datetime]
     assigned_doctor_id: Optional[int]
     assigned_at: Optional[datetime]
+    annotator_doctor_id: Optional[int] = None
+    reviewer_doctor_id: Optional[int] = None
+    review_assigned_at: Optional[datetime] = None
+    reviewed_at: Optional[datetime] = None
     submitted_at: Optional[datetime]
 
     # 扩展字段
@@ -32,6 +36,8 @@ class ReportResponse(BaseModel):
     # 医生信息（用于列表显示工号）
     doctor_employee_id: Optional[str] = None  # 医生工号
     doctor_username: Optional[str] = None  # 医生用户名
+    reviewer_employee_id: Optional[str] = None
+    reviewer_username: Optional[str] = None
     annotation_data: Optional[Any] = None
     annotation_status: Optional[str] = None
     annotation_submitted_at: Optional[datetime] = None
@@ -68,8 +74,10 @@ class AssignRequest(BaseModel):
     report_ids: Optional[List[int]] = None
     doctor_id: Optional[int] = None
     doctor_ids: Optional[List[int]] = None
+    mode: Optional[str] = "auto"  # auto / annotation / review
 
 
 class AssignResponse(BaseModel):
     assigned: int
     per_doctor: Optional[dict[str, int]] = None
+    mode: Optional[str] = None

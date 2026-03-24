@@ -137,7 +137,7 @@ export const api = {
   getImportErrors(taskId) {
     return this.get(`/reports/import-tasks/${taskId}/errors`)
   },
-  assignReports(reportIds = [], doctorId = null, doctorIds = null) {
+  assignReports(reportIds = [], doctorId = null, doctorIds = null, mode = 'auto') {
     const payload = {}
     if (Array.isArray(reportIds) && reportIds.length > 0) {
       payload.report_ids = reportIds
@@ -148,6 +148,7 @@ export const api = {
     if (Array.isArray(doctorIds) && doctorIds.length > 0) {
       payload.doctor_ids = doctorIds
     }
+    payload.mode = mode
     return this.post('/reports/assign', payload)
   },
   exportAnnotations(params = {}) {

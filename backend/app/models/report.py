@@ -33,4 +33,10 @@ class Report(Base):
     assigned_doctor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     assigned_at = Column(DateTime(timezone=True), nullable=True)
 
+    # 标注/复核责任人
+    annotator_doctor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewer_doctor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    review_assigned_at = Column(DateTime(timezone=True), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+
     submitted_at = Column(DateTime(timezone=True), nullable=True)
