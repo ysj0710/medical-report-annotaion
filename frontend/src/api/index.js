@@ -33,8 +33,13 @@ export const api = {
 
   async request(method, path, data = null) {
     const headers = { 'Content-Type': 'application/json' }
-    if (normalizeToken(token)) {
-      headers['Authorization'] = `Bearer ${token}`
+    const authToken = normalizeToken(token)
+    if (path === '/auth/me' && !authToken) {
+      this.clearToken()
+      throw new Error('Unauthorized')
+    }
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`
     }
     const options = { method, headers }
     if (data && method !== 'GET') {
@@ -80,13 +85,22 @@ export const api = {
   login(username, password) {
     return this.post('/auth/login', { username, password }).then(data => {
       this.setToken(data.access_token)
-      return this.get('/auth/me').then(user => {
-        currentUser = user
-        return user
-      })
+      return this.get('/auth/me')
+        .then(user => {
+          currentUser = user
+          return user
+        })
+        .catch(err => {
+          this.clearToken()
+          throw err
+        })
     })
   },
   getMe() {
+    if (!normalizeToken(token)) {
+      this.clearToken()
+      return Promise.reject(new Error('Unauthorized'))
+    }
     return this.get('/auth/me').then(user => {
       currentUser = user
       return user
