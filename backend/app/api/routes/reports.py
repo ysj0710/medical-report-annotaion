@@ -681,8 +681,39 @@ def export_all_reports(
             return "1"
         return "3"
 
+    report_columns = [
+        "RIS_NO", "MODALITY", "PATIENT_SEX", "PATIENT_AGE",
+        "EXAM_ITEM", "EXAM_MODE", "EXAM_GROUP", "DESCRIPTION", "IMPRESSION"
+    ]
+    annotation_columns = [
+        "RIS_NO", "CONTENT_TYPE", "ERR_TYPE", "SOURCE", "TARGET",
+        "ALERT_TYPE", "ALERT_MSG", "SOURCE_IN_START", "SOURCE_IN_END", "SOURCE_IN_LENGTH"
+    ]
+
+    def to_source_length(start, end, fallback="") -> str:
+        if fallback is not None and str(fallback).strip() != "":
+            return str(fallback)
+        if start is not None and end is not None and str(start).lstrip("-").isdigit() and str(end).lstrip("-").isdigit():
+            return str(max(0, int(end) - int(start)))
+        return ""
+
+    def empty_annotation_row(ris_no: str) -> dict:
+        return {
+            "RIS_NO": ris_no or "",
+            "CONTENT_TYPE": "",
+            "ERR_TYPE": "",
+            "SOURCE": "",
+            "TARGET": "",
+            "ALERT_TYPE": "",
+            "ALERT_MSG": "",
+            "SOURCE_IN_START": "",
+            "SOURCE_IN_END": "",
+            "SOURCE_IN_LENGTH": "",
+        }
+
     report_rows = []
-    annotation_rows = []
+    original_pre_annotation_rows = []
+    final_annotation_rows = []
 
     for report, annotation, _doctor in results:
         report_rows.append({
@@ -697,42 +728,42 @@ def export_all_reports(
             "IMPRESSION": report.impression or "",
         })
 
-        export_items = []
-        if annotation and annotation.data and annotation.data.get("error_items"):
-            export_items = annotation.data.get("error_items") or []
-        else:
-            for pre in (report.pre_annotations or []):
-                export_items.append({
-                    "error_type": pre.get("err_type") or "",
-                    "evidence_text": pre.get("source") or "",
-                    "description": pre.get("alert_message") or pre.get("alert_msg") or "",
-                    "suggestion": pre.get("target") or "",
-                    "anchor": {
-                        "content_type": pre.get("content_type"),
-                        "source_in_start": pre.get("source_in_start"),
-                        "source_in_end": pre.get("source_in_end"),
-                        "alert_type": pre.get("alert_type"),
-                        "source": pre.get("source"),
-                        "target": pre.get("target"),
-                    }
-                })
-
-        if not export_items:
-            annotation_rows.append({
+        # Sheet 2（可选）：上传时的原始预标注
+        pre_items = report.pre_annotations or []
+        for pre in pre_items:
+            source = str(pre.get("source") or "")
+            target = str(pre.get("target") or "")
+            message = str(pre.get("alert_message") or pre.get("alert_msg") or "")
+            start = pre.get("source_in_start")
+            end = pre.get("source_in_end")
+            start_text = str(start) if start is not None else ""
+            end_text = str(end) if end is not None else ""
+            alert_type = str(pre.get("alert_type") or "").strip()
+            if alert_type not in {"1", "2", "3"}:
+                alert_type = infer_alert_type({"alert_type": pre.get("alert_type")}, target, message)
+            original_pre_annotation_rows.append({
                 "RIS_NO": report.ris_no or "",
-                "CONTENT_TYPE": "",
-                "ERR_TYPE": "",
-                "SOURCE": "",
-                "TARGET": "",
-                "ALERT_TYPE": "",
-                "ALERT_MSG": "",
-                "SOURCE_IN_START": "",
-                "SOURCE_IN_END": "",
-                "SOURCE_IN_LENGTH": "",
+                "CONTENT_TYPE": normalize_content_type(pre.get("content_type")),
+                "ERR_TYPE": pre.get("err_type") or "",
+                "SOURCE": source,
+                "TARGET": target,
+                "ALERT_TYPE": alert_type,
+                "ALERT_MSG": message,
+                "SOURCE_IN_START": start_text,
+                "SOURCE_IN_END": end_text,
+                "SOURCE_IN_LENGTH": to_source_length(start, end, pre.get("source_in_length")),
             })
+
+        # Sheet 3（或无预标注时的 Sheet 2）：人工最终标注
+        final_items = []
+        if annotation and annotation.data and annotation.data.get("error_items"):
+            final_items = annotation.data.get("error_items") or []
+
+        if not final_items:
+            final_annotation_rows.append(empty_annotation_row(report.ris_no or ""))
             continue
 
-        for item in export_items:
+        for item in final_items:
             anchor = item.get("anchor") or {}
             source = str(item.get("evidence_text") or anchor.get("source") or "")
             target = str(item.get("suggestion") or anchor.get("target") or "")
@@ -741,13 +772,9 @@ def export_all_reports(
             end = anchor.get("source_in_end")
             start_text = str(start) if start is not None else ""
             end_text = str(end) if end is not None else ""
-            source_length = ""
-            if start is not None and end is not None and str(start).lstrip("-").isdigit() and str(end).lstrip("-").isdigit():
-                source_length = str(max(0, int(end) - int(start)))
-
-            annotation_rows.append({
+            final_annotation_rows.append({
                 "RIS_NO": report.ris_no or "",
-                "CONTENT_TYPE": normalize_content_type(anchor.get("content_type")),
+                "CONTENT_TYPE": normalize_content_type(anchor.get("content_type") or item.get("location")),
                 "ERR_TYPE": item.get("error_type") or "",
                 "SOURCE": source,
                 "TARGET": target,
@@ -755,13 +782,20 @@ def export_all_reports(
                 "ALERT_MSG": message,
                 "SOURCE_IN_START": start_text,
                 "SOURCE_IN_END": end_text,
-                "SOURCE_IN_LENGTH": source_length,
+                "SOURCE_IN_LENGTH": to_source_length(start, end),
             })
 
     output = BytesIO()
+    has_original_pre_annotation = len(original_pre_annotation_rows) > 0
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(report_rows).to_excel(writer, index=False, sheet_name="原始报告")
-        pd.DataFrame(annotation_rows).to_excel(writer, index=False, sheet_name="预标注")
+        pd.DataFrame(report_rows, columns=report_columns).to_excel(writer, index=False, sheet_name="原始报告")
+        if has_original_pre_annotation:
+            pd.DataFrame(original_pre_annotation_rows, columns=annotation_columns).to_excel(
+                writer, index=False, sheet_name="原始预标注"
+            )
+        pd.DataFrame(final_annotation_rows, columns=annotation_columns).to_excel(
+            writer, index=False, sheet_name="标注结果"
+        )
 
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     filename = f"annotated_reports_{timestamp}.xlsx"
