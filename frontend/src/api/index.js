@@ -154,8 +154,9 @@ export const api = {
     const query = new URLSearchParams(params).toString()
     return this.get('/export/annotations' + (query ? `?${query}` : ''))
   },
-  exportAllReports() {
-    return this.getBlob('/reports/export/all')
+  exportAllReports(params = {}) {
+    const query = new URLSearchParams(params).toString()
+    return this.getBlob('/reports/export/all' + (query ? `?${query}` : ''))
   },
 
   // Doctor

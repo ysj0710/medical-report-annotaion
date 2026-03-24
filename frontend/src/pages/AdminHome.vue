@@ -516,21 +516,50 @@ const viewReport = async (r) => {
   showWorkbenchDialog.value = true;
 };
 
+const chooseExportMode = async () => {
+  try {
+    await ElMessageBox.confirm(
+      "请选择导出方式：\n1) 多 Sheet 的单个 Excel\n2) 每个表独立 Excel，打包为 ZIP",
+      "导出方式",
+      {
+        confirmButtonText: "单个Excel（多Sheet）",
+        cancelButtonText: "ZIP（独立文件）",
+        distinguishCancelAndClose: true,
+        closeOnClickModal: true,
+        closeOnPressEscape: true,
+      },
+    );
+    return "multi_sheet";
+  } catch (action) {
+    if (action === "cancel") {
+      return "zip";
+    }
+    return null;
+  }
+};
+
+const downloadExportBlob = (blob, extension) => {
+  const url = window.URL.createObjectURL(blob);
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const fileName = `annotated_reports_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.${extension}`;
+
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.URL.revokeObjectURL(url);
+};
+
 const handleExportAllReports = async () => {
   try {
-    const blob = await api.exportAllReports();
-    const url = window.URL.createObjectURL(blob);
-    const now = new Date();
-    const pad = (n) => String(n).padStart(2, "0");
-    const fileName = `annotated_reports_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.xlsx`;
-
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = fileName;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    window.URL.revokeObjectURL(url);
+    const exportMode = await chooseExportMode();
+    if (!exportMode) return;
+    const blob = await api.exportAllReports({ export_mode: exportMode });
+    const extension = exportMode === "zip" ? "zip" : "xlsx";
+    downloadExportBlob(blob, extension);
     ElMessage.success("导出成功");
   } catch (e) {
     ElMessage.error(e.message || "导出失败");

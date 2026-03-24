@@ -2,6 +2,7 @@ import os
 import uuid
 import json
 import re
+import zipfile
 from typing import Optional, List
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Response
@@ -664,10 +665,14 @@ def export_annotations(
 
 @router.get("/export/all")
 def export_all_reports(
+    export_mode: str = Query("multi_sheet"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
     """批量导出报告与标注数据（Excel，与导入格式一致）"""
+    if export_mode not in {"multi_sheet", "zip"}:
+        raise HTTPException(status_code=400, detail="export_mode 仅支持 multi_sheet 或 zip")
+
     query = db.query(Report, Annotation, User).outerjoin(
         Annotation, Report.id == Annotation.report_id
     ).outerjoin(
@@ -807,21 +812,48 @@ def export_all_reports(
 
     output = BytesIO()
     has_original_pre_annotation = len(original_pre_annotation_rows) > 0
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(report_rows, columns=report_columns).to_excel(writer, index=False, sheet_name="原始报告")
-        if has_original_pre_annotation:
-            pd.DataFrame(original_pre_annotation_rows, columns=annotation_columns).to_excel(
-                writer, index=False, sheet_name="原始预标注"
-            )
-        pd.DataFrame(final_annotation_rows, columns=annotation_columns).to_excel(
-            writer, index=False, sheet_name="标注结果"
-        )
-
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"annotated_reports_{timestamp}.xlsx"
+    if export_mode == "zip":
+        def build_single_sheet_xlsx(rows: list, columns: list, sheet_name: str) -> bytes:
+            single_output = BytesIO()
+            with pd.ExcelWriter(single_output, engine="openpyxl") as writer:
+                pd.DataFrame(rows, columns=columns).to_excel(writer, index=False, sheet_name=sheet_name)
+            return single_output.getvalue()
+
+        with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr(
+                "01_original_reports.xlsx",
+                build_single_sheet_xlsx(report_rows, report_columns, "原始报告")
+            )
+            next_index = 2
+            if has_original_pre_annotation:
+                zip_file.writestr(
+                    f"{next_index:02d}_original_pre_annotations.xlsx",
+                    build_single_sheet_xlsx(original_pre_annotation_rows, annotation_columns, "原始预标注")
+                )
+                next_index += 1
+            zip_file.writestr(
+                f"{next_index:02d}_final_annotations.xlsx",
+                build_single_sheet_xlsx(final_annotation_rows, annotation_columns, "标注结果")
+            )
+        filename = f"annotated_reports_{timestamp}.zip"
+        media_type = "application/zip"
+    else:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            pd.DataFrame(report_rows, columns=report_columns).to_excel(writer, index=False, sheet_name="原始报告")
+            if has_original_pre_annotation:
+                pd.DataFrame(original_pre_annotation_rows, columns=annotation_columns).to_excel(
+                    writer, index=False, sheet_name="原始预标注"
+                )
+            pd.DataFrame(final_annotation_rows, columns=annotation_columns).to_excel(
+                writer, index=False, sheet_name="标注结果"
+            )
+        filename = f"annotated_reports_{timestamp}.xlsx"
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
     return Response(
         content=output.getvalue(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
