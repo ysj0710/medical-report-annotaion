@@ -1,12 +1,23 @@
 const API_BASE = '/api'
 
-let token = localStorage.getItem('token')
+function normalizeToken(raw) {
+  if (!raw) return null
+  const value = String(raw).trim()
+  if (!value || value === 'null' || value === 'undefined') return null
+  return value
+}
+
+let token = normalizeToken(localStorage.getItem('token'))
 let currentUser = null
 
 export const api = {
   setToken(t) {
-    token = t
-    localStorage.setItem('token', t)
+    token = normalizeToken(t)
+    if (token) {
+      localStorage.setItem('token', token)
+    } else {
+      localStorage.removeItem('token')
+    }
   },
   clearToken() {
     token = null
@@ -22,7 +33,7 @@ export const api = {
 
   async request(method, path, data = null) {
     const headers = { 'Content-Type': 'application/json' }
-    if (token) {
+    if (normalizeToken(token)) {
       headers['Authorization'] = `Bearer ${token}`
     }
     const options = { method, headers }
@@ -30,7 +41,7 @@ export const api = {
       options.body = JSON.stringify(data)
     }
     const res = await fetch(API_BASE + path, options)
-    if (res.status === 401) {
+    if (res.status === 401 || (path === '/auth/me' && res.status === 422)) {
       this.clearToken()
       window.location.href = '/login'
       throw new Error('Unauthorized')
