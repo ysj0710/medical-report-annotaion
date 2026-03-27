@@ -157,7 +157,7 @@
             <div class="row" v-if="card.target"><span class="label">替换内容：</span>{{ card.target || '-' }}</div>
 
             <div v-if="isEditing(card)">
-              <el-select v-model="card.error_type" placeholder="错误类型" style="width: 100%; margin-bottom: 8px" @change="applyDefaultSeverity(card)">
+              <el-select v-model="card.error_type" placeholder="错误类型" style="width: 100%; margin-bottom: 8px" @change="handleErrorTypeChange(card)">
                 <el-option v-for="item in errorTypeOptions" :key="item.value" :label="item.label" :value="item.value" />
               </el-select>
               <div class="level-title">错误级别</div>
@@ -166,16 +166,44 @@
                 <el-button :type="card.severity === 'medium' ? 'warning' : 'default'" @click="card.severity = 'medium'">中</el-button>
                 <el-button :type="card.severity === 'high' ? 'danger' : 'default'" @click="card.severity = 'high'">高</el-button>
               </el-button-group>
+              <div class="level-title">处理方式</div>
+              <div class="process-method-group">
+                <button
+                  type="button"
+                  :class="['process-method-btn', { active: card.process_method === PROCESS_METHOD.replace }]"
+                  @click="handleManualProcessMethodSelect(card, PROCESS_METHOD.replace)"
+                >
+                  替换
+                </button>
+                <button
+                  type="button"
+                  :class="['process-method-btn', { active: card.process_method === PROCESS_METHOD.prompt }]"
+                  @click="handleManualProcessMethodSelect(card, PROCESS_METHOD.prompt)"
+                >
+                  仅提示
+                </button>
+                <button
+                  type="button"
+                  :class="['process-method-btn', { active: card.process_method === PROCESS_METHOD.delete }]"
+                  @click="handleManualProcessMethodSelect(card, PROCESS_METHOD.delete)"
+                >
+                  删除
+                </button>
+              </div>
               <el-input
                 v-model="card.target"
                 placeholder="替换后内容"
+                :disabled="card.process_method !== PROCESS_METHOD.replace"
+                :class="{ 'replace-target-input': card.process_method === PROCESS_METHOD.replace }"
                 style="margin-bottom: 8px"
+                @input="handleReplacementInput(card)"
               />
               <el-input
                 v-model="card.alert_message"
                 type="textarea"
                 :rows="2"
                 placeholder="建议说明"
+                @input="handleSuggestionInput(card)"
               />
             </div>
 
@@ -248,6 +276,7 @@ const autoSaving = ref(false)
 const autoSavePending = ref(false)
 const progress = ref({ done: 0, total: 0 })
 const dismissedPreCardKeysByReport = new Map()
+const errorTypeResetTimerByCard = new Map()
 let highlightFocusTimer = null
 
 const doctorTableColumns = [
@@ -405,10 +434,45 @@ const severityText = (v) => {
 
 const errorTypeText = (type) => ERROR_TYPE_MAP[type] || type || '-'
 
-const normalizeAction = (action) => {
-  if (['replace', 'delete', 'prompt'].includes(action)) return action
+const PROCESS_METHOD = {
+  replace: '替换',
+  prompt: '仅提示',
+  delete: '删除'
+}
+
+const DELETE_HINT_PATTERN = /删除|删去|去掉|移除|多余|不应存在|应删除/
+
+const PROCESS_METHOD_BY_ERROR_TYPE = {
+  typos: PROCESS_METHOD.replace,
+  examitems: PROCESS_METHOD.prompt,
+  typo_unit: PROCESS_METHOD.prompt,
+  typo_modality: PROCESS_METHOD.prompt,
+  positions: PROCESS_METHOD.prompt,
+  bodyParts: PROCESS_METHOD.prompt,
+  typoTerms: PROCESS_METHOD.replace,
+  organectomys: PROCESS_METHOD.prompt,
+  sexs: PROCESS_METHOD.prompt
+}
+
+const processMethodToAction = (method) => {
+  if (method === PROCESS_METHOD.replace) return 'replace'
+  if (method === PROCESS_METHOD.delete) return 'delete'
   return 'prompt'
 }
+
+const actionToProcessMethod = (action) => {
+  if (action === 'replace') return PROCESS_METHOD.replace
+  if (action === 'delete') return PROCESS_METHOD.delete
+  return PROCESS_METHOD.prompt
+}
+
+const normalizeProcessMethod = (value) => {
+  if (value === PROCESS_METHOD.replace || value === 'replace' || value === '2') return PROCESS_METHOD.replace
+  if (value === PROCESS_METHOD.delete || value === 'delete' || value === '1') return PROCESS_METHOD.delete
+  return PROCESS_METHOD.prompt
+}
+
+const normalizeAction = (action) => processMethodToAction(normalizeProcessMethod(action))
 
 const normalizeInputText = (value) => String(value ?? '').trim()
 
@@ -421,7 +485,8 @@ const buildReplaceSuggestionText = (source, target) => {
 
 const buildActionSuggestionText = (card) => {
   const sourceText = normalizeInputText(card.source)
-  const action = normalizeAction(card.action || inferActionByCard(card))
+  const method = normalizeProcessMethod(card.process_method || actionToProcessMethod(card.action || inferActionByCard(card)))
+  const action = processMethodToAction(method)
   if (action === 'replace') return buildReplaceSuggestionText(sourceText, card.target)
   if (action === 'delete' && sourceText) return `建议删除“${sourceText}”`
   if (action === 'prompt' && sourceText) return `请确认“${sourceText}”是否准确`
@@ -436,6 +501,7 @@ const getCardSuggestionText = (card) => {
 }
 
 const inferActionByCard = (card) => {
+  if (card.process_method) return processMethodToAction(card.process_method)
   const alertType = normalizeAlertType(card.alert_type)
   const source = String(card.source || '').trim()
   const target = String(card.target || '').trim()
@@ -455,17 +521,129 @@ const inferActionByCard = (card) => {
   if (alertType === '0') return 'prompt'
   if (target && target !== source) return 'replace'
   if (alertType === '2') return 'replace'
-  if (/删除|删去|去掉|移除|多余|不应存在|应删除/.test(`${source}${messageRaw}`)) return 'delete'
+  if (DELETE_HINT_PATTERN.test(`${source}${messageRaw}`)) return 'delete'
   if (alertType === '1') return 'delete'
   if (/不匹配|提示|注意|建议|复查|随访|核对|检查类型/.test(messageRaw)) return 'prompt'
-  if (card.error_type === 'organectomys') return 'delete'
   return 'prompt'
 }
 
 const syncActionToAlertType = (card) => {
-  card.action = normalizeAction(card.action || inferActionByCard(card))
+  card.process_method = normalizeProcessMethod(card.process_method || actionToProcessMethod(card.action || inferActionByCard(card)))
+  card.action = processMethodToAction(card.process_method)
   const map = { replace: '2', delete: '1', prompt: '0' }
   card.alert_type = map[card.action]
+}
+
+const extractBodyPart = () => {
+  const item = normalizeInputText(currentReport.value?.exam_item)
+  if (item) return item
+  const text = `${currentReport.value?.description || ''} ${currentReport.value?.impression || ''}`
+  const matched = text.match(/(头颅|颅脑|颈部|胸部|腹部|盆腔|膝关节|髋关节|肩关节|腰椎|胸椎|颈椎|脊柱|肝脏|胆囊|胰腺|脾脏|肾脏)/)
+  return matched?.[1] || '当前检查部位'
+}
+
+const extractPositionWord = (card) => {
+  const sourceText = normalizeInputText(card.source)
+  const context = `${sourceText} ${currentReport.value?.description || ''}`
+  const matched = context.match(/(左侧|右侧|双侧|左|右|上|下|前|后|内侧|外侧)/)
+  return matched?.[1] || ''
+}
+
+const extractRemovedOrgans = () => {
+  const raw = currentReport.value?.removed_organs || currentReport.value?.resected_organs || []
+  if (Array.isArray(raw) && raw.length) return raw.join('、')
+  return ''
+}
+
+const buildDefaultSuggestionByErrorType = (card) => {
+  const source = normalizeInputText(card.source)
+  const target = normalizeInputText(card.target)
+  const examItem = normalizeInputText(currentReport.value?.exam_item) || '当前申请单项目'
+  const modality = normalizeInputText(currentReport.value?.modality) || '当前设备'
+  const bodyPart = extractBodyPart()
+  const patientSex = normalizeInputText(currentReport.value?.patient_sex) || '未知'
+  const positionWord = extractPositionWord(card)
+  const removedOrgans = extractRemovedOrgans()
+
+  switch (card.error_type) {
+    case 'typos':
+      return `建议"${source}"替换成"${target}"`
+    case 'examitems':
+      return `"${source}"检查项目矛盾/报告漏写增强。问题描述：申请单检查项目是${examItem}，报告内容与检查项目不符`
+    case 'typo_unit':
+      return '单位异常请检查核对'
+    case 'typo_modality':
+      return `"${source}"该描述与设备类型"${modality}"不符，请确认`
+    case 'positions':
+      return positionWord ? `方位不一致（检测到方位词：${positionWord}）` : '方位不一致'
+    case 'bodyParts':
+      return `"${source}"与检查部位"${bodyPart}"矛盾`
+    case 'typoTerms':
+      return `专业术语有误。建议将"${source}"改成"${target}"`
+    case 'organectomys':
+      return removedOrgans
+        ? `检查所见中，描述了与患者已记录的已切除脏器相矛盾的内容（已切除：${removedOrgans}）`
+        : '检查所见中，描述了与患者已记录的已切除脏器相矛盾的内容'
+    case 'sexs':
+      return `"${source}"与性别${patientSex}矛盾`
+    default:
+      return source ? `请确认"${source}"是否准确` : '请确认该处表述是否准确'
+  }
+}
+
+const getDefaultProcessMethodByErrorType = (errorType) => PROCESS_METHOD_BY_ERROR_TYPE[errorType] || PROCESS_METHOD.prompt
+
+const appendReplaceSuggestion = (originText, source, target) => {
+  const sourceText = normalizeInputText(source)
+  const targetText = normalizeInputText(target)
+  if (!sourceText || !targetText) return normalizeInputText(originText)
+  const appendText = `建议将"${sourceText}"改成"${targetText}"`
+  const base = normalizeInputText(originText)
+  if (!base) return `${appendText}。`
+  if (base.includes(appendText)) return base
+  const suffix = /[。.!?！？]$/.test(base) ? ' ' : '。 '
+  return `${base}${suffix}${appendText}。`
+}
+
+const enforceSuggestionLengthLimit = (card) => {
+  if (!card) return
+  const text = String(card.alert_message || '')
+  if (text.length <= 500) return
+  card.alert_message = text.slice(0, 500)
+  ElMessage.warning('建议说明最多500字符，已自动截断')
+}
+
+const extractReplacementFromSuggestion = (message) => {
+  const text = normalizeInputText(message)
+  if (!text) return ''
+  const patterns = [
+    /改成[“"]([^”"]+)[”"]/,
+    /替换(?:为|成)[“"]([^”"]+)[”"]/,
+    /替换成[“"]([^”"]+)[”"]/,
+    /替换为[“"]([^”"]+)[”"]/
+  ]
+  for (const pattern of patterns) {
+    const matched = text.match(pattern)
+    if (matched?.[1]) return normalizeInputText(matched[1])
+  }
+  const quoted = text.match(/[“"]([^”"]+)[”"]/g)
+  if (quoted?.length) {
+    const last = quoted[quoted.length - 1]
+    return normalizeInputText(last.replace(/[“”"]/g, ''))
+  }
+  return ''
+}
+
+const inferProcessMethodFromImportedData = (card) => {
+  const message = normalizeInputText(card.alert_message)
+  if (!message) return getDefaultProcessMethodByErrorType(card.error_type)
+  if (/替换/.test(message)) {
+    const extracted = extractReplacementFromSuggestion(message)
+    if (extracted) card.target = extracted
+    return PROCESS_METHOD.replace
+  }
+  if (DELETE_HINT_PATTERN.test(message)) return PROCESS_METHOD.delete
+  return PROCESS_METHOD.prompt
 }
 
 const isEditing = (card) => card.state === 'editing'
@@ -528,7 +706,7 @@ const focusCardHighlight = async (card, options = {}) => {
 
 const handleCardClick = async (card, event) => {
   const target = event?.target
-  if (target?.closest('.card-actions, .el-input, .el-textarea, .el-select, .el-button')) {
+  if (target?.closest('.card-actions, .el-input, .el-textarea, .el-select, .el-button, .process-method-btn')) {
     return
   }
   await focusCardHighlight(card, { scrollToText: true, scrollToCardList: false })
@@ -587,6 +765,87 @@ const unmarkPreCardDismissed = (reportId, card) => {
 
 const applyDefaultSeverity = (card) => {
   if (!card.severity) card.severity = riskByErrorType(card.error_type)
+}
+
+const applyProcessMethodInputState = (card) => {
+  card.process_method = normalizeProcessMethod(card.process_method)
+  if (card.process_method === PROCESS_METHOD.delete) {
+    card.target = ''
+  }
+  syncActionToAlertType(card)
+}
+
+const applyRuleAByReplacement = (card, options = {}) => {
+  const { force = false } = options
+  const replacement = normalizeInputText(card.target)
+  if (!replacement) return
+  if (card.manual_override && !force) return
+  card.process_method = PROCESS_METHOD.replace
+  card.alert_message = appendReplaceSuggestion(card.alert_message, card.source, replacement)
+  enforceSuggestionLengthLimit(card)
+  syncActionToAlertType(card)
+}
+
+const applyRuleBBySuggestion = (card) => {
+  if (card.manual_override) return
+  const suggestion = normalizeInputText(card.alert_message)
+  if (!suggestion) return
+  if (normalizeInputText(card.target)) return
+  if (DELETE_HINT_PATTERN.test(suggestion)) {
+    card.process_method = PROCESS_METHOD.delete
+    applyProcessMethodInputState(card)
+  }
+}
+
+const resetCardByErrorType = (card) => {
+  card.manual_override = false
+  card.target = ''
+  card.process_method = getDefaultProcessMethodByErrorType(card.error_type)
+  card.alert_message = buildDefaultSuggestionByErrorType(card)
+  enforceSuggestionLengthLimit(card)
+  applyProcessMethodInputState(card)
+}
+
+const scheduleErrorTypeReset = (card) => {
+  const cardId = card?.id
+  if (!cardId) return
+  const previousTimer = errorTypeResetTimerByCard.get(cardId)
+  if (previousTimer) {
+    clearTimeout(previousTimer)
+  }
+  const timer = window.setTimeout(() => {
+    resetCardByErrorType(card)
+    errorTypeResetTimerByCard.delete(cardId)
+  }, 1000)
+  errorTypeResetTimerByCard.set(cardId, timer)
+}
+
+const handleErrorTypeChange = (card) => {
+  applyDefaultSeverity(card)
+  scheduleErrorTypeReset(card)
+}
+
+const handleManualProcessMethodSelect = (card, method) => {
+  card.process_method = normalizeProcessMethod(method)
+  card.manual_override = true
+  applyProcessMethodInputState(card)
+}
+
+const handleReplacementInput = (card) => {
+  card.target = String(card.target || '')
+  if (normalizeInputText(card.target)) {
+    card.manual_override = false
+    applyRuleAByReplacement(card, { force: true })
+  } else {
+    syncActionToAlertType(card)
+  }
+}
+
+const handleSuggestionInput = (card) => {
+  card.alert_message = String(card.alert_message || '')
+  enforceSuggestionLengthLimit(card)
+  applyRuleBBySuggestion(card)
+  syncActionToAlertType(card)
 }
 
 const getReportTextByField = (field) => {
@@ -761,13 +1020,17 @@ const handleHighlightClick = (event) => {
 }
 
 const cardToErrorItem = (card) => {
+  const processMethod = normalizeProcessMethod(card.process_method)
+  const replacementContent = processMethod === PROCESS_METHOD.replace ? normalizeInputText(card.target) : ''
   return {
     error_type: card.error_type || '',
     severity: card.severity || riskByErrorType(card.error_type || ''),
     location: fieldText(card.content_type),
     evidence_text: card.source || '',
     description: card.alert_message || '',
-    suggestion: card.action === 'replace' ? (card.target || '') : '',
+    suggestion: replacementContent,
+    process_method: processMethod,
+    replacement_content: replacementContent,
     anchor: {
       content_type: normalizeContentType(card.content_type),
       source_in_start: card.source_in_start,
@@ -778,7 +1041,8 @@ const cardToErrorItem = (card) => {
       kind: card.kind,
       origin_kind: card.origin_kind,
       state: card.state,
-      action: card.action
+      action: card.action,
+      process_method: processMethod
     }
   }
 }
@@ -865,12 +1129,18 @@ const buildPreCards = (report) => {
         severity: riskByErrorType(item.err_type || 'typos'),
         source_in_start: item.source_in_start,
         source_in_end: item.source_in_end,
-        action: 'replace'
+        process_method: PROCESS_METHOD.prompt,
+        manual_override: false,
+        action: 'prompt'
       }
-      card.action = inferActionByCard(card)
-      if (card.action !== 'replace') {
+      card.process_method = normalizeProcessMethod(item.process_method || inferProcessMethodFromImportedData(card))
+      if (card.process_method === PROCESS_METHOD.delete) {
         card.target = ''
       }
+      if (!card.alert_message) {
+        card.alert_message = buildDefaultSuggestionByErrorType(card)
+      }
+      enforceSuggestionLengthLimit(card)
       syncActionToAlertType(card)
 
       const dedupKey = [
@@ -878,6 +1148,7 @@ const buildPreCards = (report) => {
         String(card.source || '').trim(),
         String(card.target || '').trim(),
         String(card.alert_type || '').trim(),
+        String(card.process_method || '').trim(),
         String(card.alert_message || '').trim(),
         String(card.error_type || '').trim(),
         String(card.source_in_start ?? ''),
@@ -898,6 +1169,7 @@ const buildManualCardsFromAnnotation = (report) => {
     const anchorKind = item.anchor?.kind
     const anchorState = item.anchor?.state
     const isPendingPre = anchorKind === 'pre' && anchorState === 'pending'
+    const rawProcessMethod = item.process_method || item.anchor?.process_method || item.anchor?.action || ''
     const card = {
       id: `manual-${report.id}-${idx}`,
       kind: isPendingPre ? 'pre' : 'manual',
@@ -905,19 +1177,25 @@ const buildManualCardsFromAnnotation = (report) => {
       state: isPendingPre ? 'pending' : 'saved',
       content_type: item.anchor?.content_type || item.location || 'description',
       source: item.evidence_text || item.anchor?.source || '',
-      target: item.suggestion || item.anchor?.target || '',
+      target: item.replacement_content || item.suggestion || item.anchor?.target || '',
       alert_type: String(item.anchor?.alert_type ?? '2'),
       alert_message: item.description || '',
       error_type: item.error_type || 'typos',
       severity: item.severity || riskByErrorType(item.error_type || 'typos'),
       source_in_start: item.anchor?.source_in_start,
       source_in_end: item.anchor?.source_in_end,
+      process_method: normalizeProcessMethod(rawProcessMethod),
+      manual_override: false,
       action: normalizeAction(item.anchor?.action)
     }
 
-    if (!['replace', 'delete', 'prompt'].includes(card.action)) {
-      card.action = inferActionByCard(card)
+    if (!normalizeInputText(rawProcessMethod)) {
+      card.process_method = inferProcessMethodFromImportedData(card)
     }
+    if (!normalizeInputText(card.alert_message)) {
+      card.alert_message = buildDefaultSuggestionByErrorType(card)
+    }
+    enforceSuggestionLengthLimit(card)
     syncActionToAlertType(card)
     return card
   })
@@ -933,6 +1211,7 @@ const dedupeCards = (items) => {
       String(card.source || '').trim(),
       String(card.target || '').trim(),
       String(card.alert_type || '').trim(),
+      String(card.process_method || '').trim(),
       String(card.alert_message || '').trim(),
       String(card.error_type || '').trim(),
       String(card.source_in_start ?? ''),
@@ -1007,6 +1286,12 @@ const autoSaveAfterInteraction = async () => {
 }
 
 const editCard = (card) => {
+  card.process_method = normalizeProcessMethod(card.process_method || actionToProcessMethod(card.action))
+  card.manual_override = !!card.manual_override
+  if (!card.alert_message) {
+    card.alert_message = buildDefaultSuggestionByErrorType(card)
+  }
+  applyProcessMethodInputState(card)
   card._backup = { ...card }
   card.state = 'editing'
   selectedCardId.value = card.id
@@ -1017,46 +1302,61 @@ const prepareCardForSave = async (card, options = {}) => {
 
   card.target = normalizeInputText(card.target)
   card.alert_message = normalizeInputText(card.alert_message)
+  card.process_method = normalizeProcessMethod(card.process_method)
+  card.manual_override = !!card.manual_override
+  enforceSuggestionLengthLimit(card)
   applyDefaultSeverity(card)
 
-  const hasTarget = !!card.target
-  const hasAlertMessage = !!card.alert_message
+  if (card.process_method === PROCESS_METHOD.delete && card.target) {
+    if (showValidationDialog) {
+      try {
+        await ElMessageBox.confirm(
+          '当前处理方式为删除，但仍存在替换内容。是否清空替换内容并继续保存？',
+          '保存前校验',
+          { confirmButtonText: '清空并继续', cancelButtonText: '返回修改', type: 'warning' }
+        )
+      } catch (_e) {
+        return false
+      }
+    }
+    card.target = ''
+  }
 
-  if (!hasTarget && !hasAlertMessage) {
+  if (card.process_method === PROCESS_METHOD.replace && !card.target) {
+    if (showValidationDialog) {
+      ElMessage.warning('请填写替换内容')
+    }
+    return false
+  }
+
+  if (card.process_method === PROCESS_METHOD.replace) {
+    card.manual_override = false
+    applyRuleAByReplacement(card, { force: true })
+  } else if (!card.manual_override) {
+    applyRuleBBySuggestion(card)
+  }
+
+  if (!card.alert_message) {
     if (allowAutoSuggestionWhenEmpty) {
-      card.action = inferActionByCard(card)
-      card.alert_message = buildActionSuggestionText(card) || '请复核该处表述是否准确'
+      card.alert_message = buildDefaultSuggestionByErrorType(card)
     } else {
       if (showValidationDialog) {
-        try {
-          await ElMessageBox.alert(
-            '非替换操作请填写建议说明，或填写替换后内容后再保存。',
-            '保存前校验',
-            { confirmButtonText: '我知道了', type: 'warning' }
-          )
-        } catch (_e) {
-          // ignore close action
-        }
+        ElMessage.warning('请填写建议说明')
       }
       return false
     }
   }
 
-  if (hasTarget) {
-    card.action = 'replace'
-    if (!card.alert_message) {
-      card.alert_message = buildReplaceSuggestionText(card.source, card.target)
-    }
-  } else {
-    card.action = inferActionByCard(card)
+  if (card.process_method === PROCESS_METHOD.replace) {
+    card.alert_message = appendReplaceSuggestion(card.alert_message, card.source, card.target)
   }
+  enforceSuggestionLengthLimit(card)
 
   syncActionToAlertType(card)
 
-  if (card.action !== 'replace') {
-    card.target = ''
-    if (!card.alert_message) {
-      card.alert_message = buildActionSuggestionText(card)
+  if (card.process_method !== PROCESS_METHOD.replace) {
+    if (card.process_method === PROCESS_METHOD.delete) {
+      card.target = ''
     }
   }
 
@@ -1186,8 +1486,13 @@ const createManualCardFromSelection = () => {
     severity: 'low',
     source_in_start: sourceInStart,
     source_in_end: sourceInEnd,
+    process_method: PROCESS_METHOD.replace,
+    manual_override: false,
     action: 'replace'
   }
+  newCard.alert_message = buildDefaultSuggestionByErrorType(newCard)
+  enforceSuggestionLengthLimit(newCard)
+  syncActionToAlertType(newCard)
 
   cards.value.push(newCard)
   selectedCardId.value = newCard.id
@@ -1409,6 +1714,8 @@ const handleOnlyMineChange = async (value) => {
 
 onBeforeUnmount(() => {
   clearHighlightFocus()
+  errorTypeResetTimerByCard.forEach((timer) => clearTimeout(timer))
+  errorTypeResetTimerByCard.clear()
 })
 
 onMounted(async () => {
@@ -1735,6 +2042,34 @@ onMounted(async () => {
 
 .severity-group :deep(.el-button) {
   width: 33.33%;
+}
+
+.process-method-group {
+  display: flex;
+  width: 100%;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.process-method-btn {
+  flex: 1;
+  height: 30px;
+  border: 1px solid #111827;
+  border-radius: 4px;
+  background: #f9fafb;
+  color: #111827;
+  cursor: pointer;
+}
+
+.process-method-btn.active {
+  background: #f59e0b;
+  border-color: #d97706;
+  color: #111827;
+  font-weight: 600;
+}
+
+.replace-target-input :deep(.el-input__wrapper) {
+  box-shadow: 0 0 0 1px #f59e0b inset;
 }
 
 .card-actions {

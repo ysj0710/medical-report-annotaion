@@ -10,6 +10,8 @@ class ErrorItem(BaseModel):
     evidence_text: Optional[str] = None
     description: Optional[str] = None
     suggestion: Optional[str] = None
+    process_method: Optional[str] = None
+    replacement_content: Optional[str] = None
     anchor: Optional[dict] = None
 
 

@@ -786,7 +786,15 @@ def export_all_reports(
             return "impression"
         return "description"
 
-    def infer_alert_type(anchor: dict, suggestion: str, message: str) -> str:
+    def infer_alert_type(anchor: dict, suggestion: str, message: str, process_method: str = "") -> str:
+        process_method_text = str(process_method or "").strip()
+        if process_method_text in {"替换", "replace"}:
+            return "2"
+        if process_method_text in {"删除", "delete"}:
+            return "1"
+        if process_method_text in {"仅提示", "prompt"}:
+            return "0"
+
         action = str((anchor or {}).get("action") or "").strip().lower()
         if action == "prompt":
             return "0"
@@ -889,7 +897,7 @@ def export_all_reports(
         for item in final_items:
             anchor = item.get("anchor") or {}
             source = str(item.get("evidence_text") or anchor.get("source") or "")
-            target = str(item.get("suggestion") or anchor.get("target") or "")
+            target = str(item.get("replacement_content") or item.get("suggestion") or anchor.get("target") or "")
             message = str(item.get("description") or "")
             start = anchor.get("source_in_start")
             end = anchor.get("source_in_end")
@@ -901,7 +909,7 @@ def export_all_reports(
                 "ERR_TYPE": item.get("error_type") or "",
                 "SOURCE": source,
                 "TARGET": target,
-                "ALERT_TYPE": infer_alert_type(anchor, target, message),
+                "ALERT_TYPE": infer_alert_type(anchor, target, message, item.get("process_method")),
                 "ALERT_MSG": message,
                 "SOURCE_IN_START": start_text,
                 "SOURCE_IN_END": end_text,
