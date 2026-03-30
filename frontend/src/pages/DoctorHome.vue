@@ -597,6 +597,9 @@ const extractPositionWord = (card) => {
 
 const getDefaultProcessMethodByErrorType = (errorType) => PROCESS_METHOD_BY_ERROR_TYPE[errorType] || PROCESS_METHOD.delete
 
+const shouldPrefillTargetByErrorType = (errorType) =>
+  getDefaultProcessMethodByErrorType(errorType) === PROCESS_METHOD.replace
+
 const buildPromptSuggestionByErrorType = (card) => {
   const source = normalizeInputText(card.source)
   const modality = normalizeInputText(currentReport.value?.modality) || '当前设备'
@@ -780,7 +783,12 @@ const extractReplacementFromSuggestion = (message) => {
 
 const inferProcessMethodFromImportedData = (card) => {
   const message = normalizeInputText(card.alert_message)
+  const defaultMethod = getDefaultProcessMethodByErrorType(card.error_type)
   if (/替换/.test(message)) {
+    // 非默认“替换”类型，不根据导入建议自动带入替换内容。
+    if (defaultMethod !== PROCESS_METHOD.replace) {
+      return defaultMethod
+    }
     const extracted = extractReplacementFromSuggestion(message)
     if (extracted) card.target = extracted
     return PROCESS_METHOD.replace
@@ -944,21 +952,13 @@ const handleManualProcessMethodSelect = (card, method) => {
   const nextMethod = normalizeProcessMethod(method)
   const currentMethod = normalizeProcessMethod(card.process_method)
   if (nextMethod === currentMethod) return
-  const previousSuggestion = normalizeInputText(card.alert_message)
-  if (previousSuggestion) {
-    setCachedSuggestionByMethod(card, currentMethod, previousSuggestion)
-  }
   card.process_method = nextMethod
   card.manual_override = true
   applyProcessMethodInputState(card)
-  card.alert_message = buildSuggestionByMethodWithCachedBase(card, card.process_method, {
-    replacementText: card.target
-  })
+  // 手动切换处理方式时，不自动改写建议说明。
   if (card.process_method !== PROCESS_METHOD.replace || normalizeInputText(card.target)) {
     card._targetValidationError = ''
   }
-  setCachedSuggestionByMethod(card, card.process_method, card.alert_message)
-  enforceSuggestionLengthLimit(card)
 }
 
 const handleReplacementInput = (card) => {
@@ -1278,6 +1278,8 @@ const buildPreCards = (report) => {
       const importedSuggestion = normalizeInputText(
         item.alert_message || item.alert_msg || item.description || item.suggestion_message || item.suggestion_note || ''
       )
+      const importedErrorType = item.err_type || 'typos'
+      const importedTarget = normalizeInputText(item.target)
       const card = {
         id: `pre-${report.id}-${idx}`,
         kind: 'pre',
@@ -1285,11 +1287,11 @@ const buildPreCards = (report) => {
         state: 'pending',
         content_type: item.content_type || '',
         source: item.source || '',
-        target: item.target || '',
+        target: shouldPrefillTargetByErrorType(importedErrorType) ? importedTarget : '',
         alert_type: String(item.alert_type ?? '2'),
         alert_message: item.alert_message || item.alert_msg || item.description || item.suggestion_message || item.suggestion_note || '',
-        error_type: item.err_type || 'typos',
-        severity: normalizeImportedSeverity(item.error_level || item.severity, item.err_type || 'typos'),
+        error_type: importedErrorType,
+        severity: normalizeImportedSeverity(item.error_level || item.severity, importedErrorType),
         source_in_start: item.source_in_start,
         source_in_end: item.source_in_end,
         process_method: PROCESS_METHOD.prompt,
