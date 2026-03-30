@@ -33,6 +33,7 @@ export const api = {
 
   async request(method, path, data = null) {
     const headers = { 'Content-Type': 'application/json' }
+    const isLoginPath = path === '/auth/login'
     const authToken = normalizeToken(token)
     if (path === '/auth/me' && !authToken) {
       this.clearToken()
@@ -46,7 +47,7 @@ export const api = {
       options.body = JSON.stringify(data)
     }
     const res = await fetch(API_BASE + path, options)
-    if (res.status === 401 || (path === '/auth/me' && res.status === 422)) {
+    if (!isLoginPath && (res.status === 401 || (path === '/auth/me' && res.status === 422))) {
       this.clearToken()
       window.location.href = '/login'
       throw new Error('Unauthorized')
@@ -138,6 +139,9 @@ export const api = {
   deleteReport(id) {
     return this.delete(`/reports/${id}`)
   },
+  batchDeleteReports(reportIds = []) {
+    return this.post('/reports/batch-delete', { report_ids: reportIds })
+  },
   importReports(file, preAnnotationFile = null) {
     const formData = new FormData()
     formData.append('file', file)
@@ -162,10 +166,29 @@ export const api = {
   getImportErrors(taskId) {
     return this.get(`/reports/import-tasks/${taskId}/errors`)
   },
-  assignReports(reportIds = [], doctorId = null, doctorIds = null, mode = 'auto') {
+  assignReports({
+    mode,
+    reportIds = [],
+    assignAll = false,
+    q = '',
+    status = '',
+    doctorId = null,
+    doctorIds = null,
+    dispatchMode = 'auto'
+  } = {}) {
     const payload = {}
+    payload.mode = mode
     if (Array.isArray(reportIds) && reportIds.length > 0) {
       payload.report_ids = reportIds
+    }
+    if (assignAll) {
+      payload.assign_all = true
+    }
+    if (q) {
+      payload.q = q
+    }
+    if (status) {
+      payload.status = status
     }
     if (doctorId !== null && doctorId !== undefined && doctorId !== '') {
       payload.doctor_id = doctorId
@@ -173,7 +196,7 @@ export const api = {
     if (Array.isArray(doctorIds) && doctorIds.length > 0) {
       payload.doctor_ids = doctorIds
     }
-    payload.mode = mode
+    payload.dispatch_mode = dispatchMode
     return this.post('/reports/assign', payload)
   },
   exportAnnotations(params = {}) {

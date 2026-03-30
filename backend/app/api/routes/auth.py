@@ -15,15 +15,20 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         User.username == request.username,
         User.is_cancel == False
     ).first()
-    if not user or not verify_password(request.password, user.password_hash):
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password"
+            detail="不存在的用户"
+        )
+    if not verify_password(request.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="密码错误"
         )
     if not user.enabled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Inactive user"
+            detail="用户已被禁用，请联系管理员"
         )
     access_token = create_access_token(data={"sub": user.username, "role": user.role})
     return TokenResponse(access_token=access_token, role=user.role)

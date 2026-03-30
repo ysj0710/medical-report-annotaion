@@ -17,7 +17,8 @@ from ...models.import_task import ImportTask
 from ...models.annotation import Annotation
 from ...schemas.report import (
     ReportResponse, ReportListResponse,
-    ImportTaskResponse, AssignRequest, AssignResponse
+    ImportTaskResponse, AssignRequest, AssignResponse,
+    BatchDeleteRequest, BatchDeleteResponse
 )
 from ..deps import get_current_user, require_role
 
@@ -51,6 +52,7 @@ COLUMN_MAPPING = {
     "EXAM_GROUP": "exam_group",
     "DESCRIPTION": "description",
     "IMPRESSION": "impression",
+    "ERROR_LEVEL": "error_level",
 
     # 中文表头 (兼容)
     "检查号": "ris_no",
@@ -62,6 +64,7 @@ COLUMN_MAPPING = {
     "检查组": "exam_group",
     "检查所见": "description",
     "诊断意见": "impression",
+    "错误级别": "error_level",
 
     # 旧字段兼容
     "报告全文": "report_text",
@@ -91,6 +94,23 @@ COLUMN_MAPPING = {
     "accession_no": "accession_no",
     "来源科室": "source_dept",
     "source_dept": "source_dept",
+    # 兼容预标注列（当预标注字段与原始报告在同一个文件时）
+    "CONTENT_TYPE": "content_type",
+    "ERR_TYPE": "err_type",
+    "SOURCE": "source",
+    "TARGET": "target",
+    "ALERT_TYPE": "alert_type",
+    "ALTER_TYPE": "alert_type",
+    "ALERT_MSG": "alert_msg",
+    "ALERT_MESSAGE": "alert_msg",
+    "SOURCE_IN_START": "source_in_start",
+    "SOURCE_IN_END": "source_in_end",
+    "SOURCE_IN_LENGTH": "source_in_length",
+    "ERR_LEVEL": "error_level",
+    "SEVERITY": "error_level",
+    "ERRORLEVEL": "error_level",
+    "ERROR LEVEL": "error_level",
+    "级别": "error_level",
 }
 
 
@@ -109,6 +129,37 @@ def normalize_alert_type_text(value: Optional[str]) -> str:
     if re.fullmatch(r"-?\d+\.0+", text):
         return text.split(".", 1)[0]
     return text
+
+
+def infer_error_level_by_error_type(error_type: Optional[str]) -> str:
+    error_type_text = str(error_type or "").strip()
+    if error_type_text in {"sexs", "typos", "typoTerms"}:
+        return "low"
+    if error_type_text in {"bodyParts", "examitems", "typo_modality"}:
+        return "medium"
+    if error_type_text in {"typo_unit", "organectomys", "positions"}:
+        return "high"
+    return "medium"
+
+
+def normalize_error_level_text(value: Optional[str]) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw in {"low", "l", "1", "低", "轻", "轻度"}:
+        return "low"
+    if raw in {"medium", "med", "m", "2", "中", "中度"}:
+        return "medium"
+    if raw in {"high", "h", "3", "高", "重", "重度"}:
+        return "high"
+    return ""
+
+
+def resolve_error_level(value: Optional[str], error_type: Optional[str]) -> str:
+    normalized = normalize_error_level_text(value)
+    if normalized:
+        return normalized
+    return infer_error_level_by_error_type(error_type)
 
 
 def normalize_columns(df: pd.DataFrame) -> dict:
@@ -211,6 +262,21 @@ def parse_pre_annotation_file(content: bytes, filename: str) -> dict:
                     text = normalize_alert_type_text(text)
                 annotation[mapped_col] = text
 
+        raw_error_level = get_row_value(
+            row,
+            "ERROR_LEVEL",
+            "ERR_LEVEL",
+            "SEVERITY",
+            "ERRORLEVEL",
+            "ERROR LEVEL",
+            "错误级别",
+            "级别",
+        )
+        if pd.notna(raw_error_level):
+            annotation["error_level"] = resolve_error_level(str(raw_error_level).strip(), annotation.get("err_type"))
+        else:
+            annotation["error_level"] = infer_error_level_by_error_type(annotation.get("err_type"))
+
         # 兼容 ALERT_MESSAGE 字段名
         alert_message = get_row_value(row, "ALERT_MESSAGE", "ALERT_MSG", "提示信息")
         if pd.notna(alert_message):
@@ -223,6 +289,59 @@ def parse_pre_annotation_file(content: bytes, filename: str) -> dict:
             result[ris_no].append(annotation)
 
     return result
+
+
+def build_inline_pre_annotations(record: dict) -> List[dict]:
+    """从原始报告行中提取预标注字段（兼容单文件导入场景）。"""
+    err_type = str(record.get("err_type") or "").strip()
+    source = str(record.get("source") or "").strip()
+    target = str(record.get("target") or "").strip()
+    alert_msg = str(record.get("alert_msg") or "").strip()
+    content_type = str(record.get("content_type") or "").strip()
+    alert_type = normalize_alert_type_text(record.get("alert_type"))
+    source_in_start = str(record.get("source_in_start") or "").strip()
+    source_in_end = str(record.get("source_in_end") or "").strip()
+    source_in_length = str(record.get("source_in_length") or "").strip()
+    raw_error_level = str(record.get("error_level") or "").strip()
+
+    has_any_pre_field = any([
+        err_type,
+        source,
+        target,
+        alert_msg,
+        content_type,
+        alert_type,
+        source_in_start,
+        source_in_end,
+        source_in_length,
+        raw_error_level,
+    ])
+    if not has_any_pre_field:
+        return []
+
+    annotation = {}
+    if content_type:
+        annotation["content_type"] = content_type
+    if err_type:
+        annotation["err_type"] = err_type
+    if source:
+        annotation["source"] = source
+    if target:
+        annotation["target"] = target
+    if alert_type:
+        annotation["alert_type"] = alert_type
+    if alert_msg:
+        annotation["alert_msg"] = alert_msg
+        annotation["alert_message"] = alert_msg
+    if source_in_start:
+        annotation["source_in_start"] = source_in_start
+    if source_in_end:
+        annotation["source_in_end"] = source_in_end
+    if source_in_length:
+        annotation["source_in_length"] = source_in_length
+
+    annotation["error_level"] = resolve_error_level(raw_error_level, err_type)
+    return [annotation]
 
 
 @router.post("/import")
@@ -297,6 +416,8 @@ def import_reports(
             try:
                 ris_no = normalize_identifier(record.get("ris_no"))
                 pre_annotations = pre_annotations_map.get(ris_no, []) if ris_no else []
+                if not pre_annotations:
+                    pre_annotations = build_inline_pre_annotations(record)
 
                 # 检查RIS_NO是否已存在，存在则更新，不存在则新增
                 existing_report = None
@@ -488,6 +609,39 @@ def list_reports(
     )
 
 
+@router.post("/batch-delete", response_model=BatchDeleteResponse)
+def batch_delete_reports(
+    request: BatchDeleteRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(["admin"]))
+):
+    """批量删除报告（软删除，允许任意状态）"""
+    report_ids = [int(report_id) for report_id in (request.report_ids or [])]
+    report_ids = list(dict.fromkeys(report_ids))
+    if not report_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一条报告")
+
+    existing_ids = {
+        int(row[0]) for row in db.query(Report.id).filter(
+            Report.id.in_(report_ids),
+            Report.is_cancel == False
+        ).all()
+    }
+    missing_ids = [str(report_id) for report_id in report_ids if report_id not in existing_ids]
+    if missing_ids:
+        preview = "、".join(missing_ids[:20])
+        if len(missing_ids) > 20:
+            preview += "……"
+        raise HTTPException(status_code=400, detail=f"以下报告不存在或已删除：{preview}")
+
+    deleted = db.query(Report).filter(
+        Report.id.in_(report_ids),
+        Report.is_cancel == False
+    ).update({Report.is_cancel: True}, synchronize_session=False)
+    db.commit()
+    return {"ok": True, "deleted": deleted}
+
+
 @router.get("/{report_id}", response_model=ReportResponse)
 def get_report(
     report_id: int,
@@ -547,12 +701,10 @@ def delete_report(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
-    """删除报告（仅允许删除 IMPORTED 状态的报告）"""
+    """删除报告（软删除，允许任意状态）"""
     report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    if report.status != "IMPORTED":
-        raise HTTPException(status_code=400, detail="只能删除未分发的报告")
     report.is_cancel = True
     db.commit()
     return {"ok": True}
@@ -565,9 +717,9 @@ def assign_reports(
     current_user: User = Depends(require_role(["admin"]))
 ):
     """分发报告给医生。
-    mode=annotation: 首次标注分发
-    mode=review: 复核分发（仅已提交报告）
-    mode=auto: 优先首次分发，如无可分发项则执行复核分发
+    request.mode=selected: 仅分配 report_ids 内的报告
+    request.mode=all: 分配当前筛选条件下的报告
+    request.dispatch_mode=annotation/review/auto: 分发类型
     """
     selected_doctor_ids: List[int] = []
     if request.doctor_ids:
@@ -590,9 +742,13 @@ def assign_reports(
     if len(doctors) != len(selected_doctor_ids):
         raise HTTPException(status_code=400, detail="医生不存在或已被禁用")
 
-    mode = str(request.mode or "auto").strip().lower()
-    if mode not in {"auto", "annotation", "review"}:
-        raise HTTPException(status_code=400, detail="mode 仅支持 auto / annotation / review")
+    selection_mode = str(request.mode or "").strip().lower()
+    if selection_mode not in {"selected", "all"}:
+        raise HTTPException(status_code=400, detail="mode 仅支持 selected / all")
+
+    dispatch_mode = str(request.dispatch_mode or "auto").strip().lower()
+    if dispatch_mode not in {"auto", "annotation", "review"}:
+        raise HTTPException(status_code=400, detail="dispatch_mode 仅支持 auto / annotation / review")
 
     # 首次标注可分配集合：
     # 1) 待分发（IMPORTED）
@@ -613,29 +769,97 @@ def assign_reports(
         Report.status == STATUS_SUBMITTED
     )
 
-    if request.report_ids:
-        annotation_query = annotation_query.filter(
-            Report.id.in_(request.report_ids),
-            Report.status.in_([STATUS_IMPORTED, STATUS_ASSIGNED])
-        )
-        review_query = review_query.filter(Report.id.in_(request.report_ids))
+    selected_report_ids: List[int] = []
 
-        # 显式点选首次分发时，若包含已开始编辑/已提交报告，直接阻断并提示
-        locked_reports = db.query(Report.id).join(
+    def _is_annotation_candidate(status: str, annotation_id: Optional[int]) -> bool:
+        return status == STATUS_IMPORTED or (status == STATUS_ASSIGNED and annotation_id is None)
+
+    if selection_mode == "selected":
+        selected_report_ids = [int(report_id) for report_id in (request.report_ids or [])]
+        selected_report_ids = list(dict.fromkeys(selected_report_ids))
+        if not selected_report_ids:
+            raise HTTPException(status_code=400, detail="请选择要分配的报告")
+
+        selected_rows = db.query(
+            Report.id,
+            Report.status,
+            Annotation.id
+        ).outerjoin(
             Annotation, Report.id == Annotation.report_id
         ).filter(
             Report.is_cancel == False,
-            Report.id.in_(request.report_ids),
-            Report.status == STATUS_ASSIGNED
+            Report.id.in_(selected_report_ids)
         ).all()
-        if locked_reports:
-            locked_ids = [str(item[0]) for item in locked_reports]
-            preview = "、".join(locked_ids[:20])
-            if len(locked_ids) > 20:
+        selected_map = {int(row[0]): (row[1], row[2]) for row in selected_rows}
+        missing_ids = [str(report_id) for report_id in selected_report_ids if report_id not in selected_map]
+        if missing_ids:
+            preview = "、".join(missing_ids[:20])
+            if len(missing_ids) > 20:
                 preview += "……"
-            raise HTTPException(
-                status_code=400,
-                detail=f"以下报告已开始编辑或已提交，不能二次分发：{preview}"
+            raise HTTPException(status_code=400, detail=f"以下报告不存在或已删除：{preview}")
+
+        if dispatch_mode == "annotation":
+            invalid_rows = [
+                str(report_id)
+                for report_id in selected_report_ids
+                if not _is_annotation_candidate(selected_map[report_id][0], selected_map[report_id][1])
+            ]
+            if invalid_rows:
+                preview = "、".join(invalid_rows[:20])
+                if len(invalid_rows) > 20:
+                    preview += "……"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"以下报告不满足首次分配条件（需为 IMPORTED，或 ASSIGNED 且未开始标注）：{preview}"
+                )
+        elif dispatch_mode == "review":
+            invalid_rows = [
+                str(report_id)
+                for report_id in selected_report_ids
+                if selected_map[report_id][0] != STATUS_SUBMITTED
+            ]
+            if invalid_rows:
+                preview = "、".join(invalid_rows[:20])
+                if len(invalid_rows) > 20:
+                    preview += "……"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"以下报告不满足复核分配条件（仅支持 SUBMITTED）：{preview}"
+                )
+        else:
+            all_annotation = all(
+                _is_annotation_candidate(selected_map[report_id][0], selected_map[report_id][1])
+                for report_id in selected_report_ids
+            )
+            all_review = all(
+                selected_map[report_id][0] == STATUS_SUBMITTED
+                for report_id in selected_report_ids
+            )
+            if all_annotation:
+                dispatch_mode = "annotation"
+            elif all_review:
+                dispatch_mode = "review"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="选中分配不支持混合状态。首次分配仅可选 IMPORTED/ASSIGNED(未开始)，复核分配仅可选 SUBMITTED"
+                )
+
+        annotation_query = annotation_query.filter(Report.id.in_(selected_report_ids))
+        review_query = review_query.filter(Report.id.in_(selected_report_ids))
+    else:
+        if not request.assign_all:
+            raise HTTPException(status_code=400, detail="全量分配请求缺少 assign_all=true")
+        if request.status:
+            annotation_query = annotation_query.filter(Report.status == request.status)
+            review_query = review_query.filter(Report.status == request.status)
+        if request.q:
+            q_like = f"%{request.q}%"
+            annotation_query = annotation_query.filter(
+                or_(Report.external_id.ilike(q_like), Report.report_text.ilike(q_like))
+            )
+            review_query = review_query.filter(
+                or_(Report.external_id.ilike(q_like), Report.report_text.ilike(q_like))
             )
 
     annotation_reports = annotation_query.order_by(Report.id.asc()).all()
@@ -643,9 +867,9 @@ def assign_reports(
 
     selected_mode = "annotation"
     reports = []
-    if mode == "annotation":
+    if dispatch_mode == "annotation":
         reports = annotation_reports
-    elif mode == "review":
+    elif dispatch_mode == "review":
         reports = review_reports
         selected_mode = "review"
     else:
@@ -657,6 +881,17 @@ def assign_reports(
 
     if not reports:
         return AssignResponse(assigned=0, per_doctor={}, mode=selected_mode)
+
+    if selected_mode == "review" and selection_mode == "all":
+        has_pending_annotation = db.query(Report.id).filter(
+            Report.is_cancel == False,
+            Report.status.in_([STATUS_IMPORTED, STATUS_ASSIGNED, STATUS_IN_PROGRESS])
+        ).first()
+        if has_pending_annotation:
+            raise HTTPException(
+                status_code=400,
+                detail="仍有报告处于待分发/已分发/标注中，需全部完成首次标注后才能执行复核分配"
+            )
 
     per_doctor: dict[str, int] = {str(doctor_id): 0 for doctor_id in selected_doctor_ids}
     now = datetime.utcnow()
@@ -711,8 +946,16 @@ def assign_reports(
                 detail=f"以下报告无法分配复核（复核人与标注人不能相同）：{preview}"
             )
 
-    db.commit()
     assigned_total = sum(per_doctor.values())
+    if selection_mode == "selected":
+        expected_total = len(selected_report_ids)
+        if assigned_total != expected_total:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"分配数量异常：期望 {expected_total} 条，实际 {assigned_total} 条，已回滚"
+            )
+    db.commit()
     return AssignResponse(assigned=assigned_total, per_doctor=per_doctor, mode=selected_mode)
 
 
@@ -764,18 +1007,36 @@ def export_annotations(
 @router.get("/export/all")
 def export_all_reports(
     export_mode: str = Query("multi_sheet"),
+    export_scope: str = Query("all"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["admin"]))
 ):
     """批量导出报告与标注数据（Excel，与导入格式一致）"""
     if export_mode not in {"multi_sheet", "zip"}:
         raise HTTPException(status_code=400, detail="export_mode 仅支持 multi_sheet 或 zip")
+    if export_scope not in {"all", "completed", "submitted", "done"}:
+        raise HTTPException(status_code=400, detail="export_scope 仅支持 all、submitted、done 或 completed")
 
     query = db.query(Report, Annotation, User).outerjoin(
         Annotation, Report.id == Annotation.report_id
     ).outerjoin(
         User, Report.assigned_doctor_id == User.id
-    ).filter(Report.is_cancel == False).order_by(Report.id.asc())
+    ).filter(Report.is_cancel == False)
+
+    if export_scope in {"completed", "submitted", "done"}:
+        query = query.filter(
+            Annotation.id.isnot(None),
+            Annotation.status == "SUBMITTED",
+        )
+        if export_scope == "submitted":
+            query = query.filter(Report.status == STATUS_SUBMITTED)
+        elif export_scope == "done":
+            query = query.filter(Report.status == STATUS_DONE)
+        else:
+            # 兼容旧参数 completed（已提交 + 已完成）
+            query = query.filter(Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]))
+
+    query = query.order_by(Report.id.asc())
     results = query.all()
 
     def normalize_content_type(value: str) -> str:
@@ -818,7 +1079,7 @@ def export_all_reports(
     ]
     annotation_columns = [
         "RIS_NO", "CONTENT_TYPE", "ERR_TYPE", "SOURCE", "TARGET",
-        "ALERT_TYPE", "ALERT_MSG", "SOURCE_IN_START", "SOURCE_IN_END", "SOURCE_IN_LENGTH"
+        "ALERT_TYPE", "ALERT_MSG", "SOURCE_IN_START", "SOURCE_IN_END", "SOURCE_IN_LENGTH", "ERROR_LEVEL"
     ]
 
     def to_source_length(start, end, fallback="") -> str:
@@ -840,6 +1101,7 @@ def export_all_reports(
             "SOURCE_IN_START": "",
             "SOURCE_IN_END": "",
             "SOURCE_IN_LENGTH": "",
+            "ERROR_LEVEL": "",
         }
 
     report_rows = []
@@ -883,6 +1145,7 @@ def export_all_reports(
                 "SOURCE_IN_START": start_text,
                 "SOURCE_IN_END": end_text,
                 "SOURCE_IN_LENGTH": to_source_length(start, end, pre.get("source_in_length")),
+                "ERROR_LEVEL": resolve_error_level(pre.get("error_level"), pre.get("err_type")),
             })
 
         # Sheet 3（或无预标注时的 Sheet 2）：人工最终标注
@@ -914,6 +1177,7 @@ def export_all_reports(
                 "SOURCE_IN_START": start_text,
                 "SOURCE_IN_END": end_text,
                 "SOURCE_IN_LENGTH": to_source_length(start, end),
+                "ERROR_LEVEL": resolve_error_level(item.get("severity"), item.get("error_type")),
             })
 
     output = BytesIO()

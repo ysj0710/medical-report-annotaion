@@ -28,7 +28,7 @@
 
       <div class="report-list-wrap">
         <div class="report-list-header">
-          <span>任务列表（{{ reportList.length }} 条）</span>
+          <span>任务列表（当前 {{ reportList.length }} / 共 {{ reportTotal }}）</span>
           <el-popover placement="bottom-end" :width="320" trigger="click">
             <template #reference>
               <el-button size="small" text>自定义字段</el-button>
@@ -94,7 +94,10 @@
       <div class="middle-header">
         <div>
           <div class="report-title">{{ reportHeaderTitle }}</div>
-          <div class="report-meta">检查号：{{ currentReport?.ris_no || '-' }}</div>
+          <div class="report-meta">
+            检查号：{{ currentReport?.ris_no || '-' }}
+            <template v-if="showPatientSexInMeta"> 性别：{{ currentReport?.patient_sex || '未知' }}</template>
+          </div>
         </div>
         <div class="middle-actions">
           <el-checkbox v-model="autoGoNextAfterSubmit" class="auto-next-toggle">完成之后自动进入下一个</el-checkbox>
@@ -110,6 +113,9 @@
         <div class="sheet-head">
           <h2>{{ reportHeaderTitle }}</h2>
           <div>项目：{{ currentReport.exam_item || '-' }}</div>
+          <div class="sheet-meta-line">
+            性别：{{ currentReport.patient_sex || '未知' }}　年龄：{{ currentReport.patient_age || '-' }}
+          </div>
         </div>
 
         <div class="sheet-body">
@@ -130,7 +136,7 @@
     <aside class="right-panel">
       <div class="right-header">纠错建议</div>
       <div class="cards" ref="cardsContainerRef">
-        <el-empty v-if="cards.length === 0" description="暂无纠错卡片" />
+        <el-empty v-if="cards.length === 0" description="暂无纠错内容" />
 
         <el-card
           v-for="(card, idx) in cards"
@@ -192,12 +198,17 @@
               </div>
               <el-input
                 v-model="card.target"
-                placeholder="替换后内容"
-                :disabled="card.process_method !== PROCESS_METHOD.replace"
-                :class="{ 'replace-target-input': card.process_method === PROCESS_METHOD.replace }"
+                placeholder="替换后内容（仅提示/删除可不填写）"
+                :class="{
+                  'replace-target-input': card.process_method === PROCESS_METHOD.replace,
+                  'replace-target-input-error': !!card._targetValidationError
+                }"
                 style="margin-bottom: 8px"
                 @input="handleReplacementInput(card)"
+                @focus="handleReplacementFocus(card)"
+                @blur="handleReplacementBlur(card)"
               />
+              <div v-if="card._targetValidationError" class="card-inline-error">{{ card._targetValidationError }}</div>
               <el-input
                 v-model="card.alert_message"
                 type="textarea"
@@ -233,10 +244,10 @@
               type="danger"
               plain
               class="revoke-btn"
-              @click.stop="revokeCard(card)"
+              @click.stop="deleteCard(card)"
               :disabled="isEditingLocked"
             >
-              撤销
+              删除
             </el-button>
           </div>
         </el-card>
@@ -257,8 +268,9 @@ const props = defineProps({
 
 const TASK_COLUMNS_STORAGE_KEY = 'doctor_task_visible_columns_v1'
 const DISMISSED_PRE_STORAGE_KEY = 'doctor_dismissed_pre_cards_v1'
+const DOCTOR_LIST_PAGE_SIZE = 1000
 
-const activeFilter = ref('all')
+const activeFilter = ref(props.isAdminMode ? 'all' : 'unannotated')
 const reportQuery = ref('')
 const onlyMine = ref(true)
 const currentUser = ref(null)
@@ -266,6 +278,7 @@ const currentUser = ref(null)
 const doctorTableRef = ref(null)
 const cardsContainerRef = ref(null)
 const reportList = ref([])
+const reportTotal = ref(0)
 const currentReport = ref(null)
 const cards = ref([])
 const selectedCardId = ref(null)
@@ -292,27 +305,27 @@ const doctorTableColumns = [
 const visibleColumnKeys = ref(doctorTableColumns.map((item) => item.key))
 
 const ERROR_TYPE_MAP = {
-  bodyParts: '部位错误',
-  examitems: '检查项目错误',
-  organectomys: '器官切除/缺如信息错误',
-  positions: '体位/位置错误',
-  sexs: '性别错误',
-  typo_modality: '检查类型错写',
-  typo_unit: '单位错写/错误',
-  typos: '错别字/拼写错误',
-  typoTerms: '术语错写/术语错误'
+  typos: '文字错误',
+  examitems: '检查项目不一致错误',
+  typo_unit: '单位错误',
+  typo_modality: '检查设备一致性错误',
+  positions: '方位一致性错误',
+  bodyParts: '部位不一致错误',
+  typoTerms: '术语不一致',
+  organectomys: '器官切除不一致错误',
+  sexs: '性别不一致错误'
 }
 
 const errorTypeOptions = [
-  { value: 'sexs', label: '性别错误' },
-  { value: 'typos', label: '错别字/拼写错误' },
-  { value: 'typoTerms', label: '术语错写/术语错误' },
-  { value: 'bodyParts', label: '部位错误' },
-  { value: 'examitems', label: '检查项目错误' },
-  { value: 'typo_modality', label: '检查类型错写' },
-  { value: 'typo_unit', label: '单位错写/错误' },
-  { value: 'organectomys', label: '器官切除/缺如信息错误' },
-  { value: 'positions', label: '体位/位置错误' }
+  { value: 'typos', label: '文字错误' },
+  { value: 'examitems', label: '检查项目不一致错误' },
+  { value: 'typo_unit', label: '单位错误' },
+  { value: 'typo_modality', label: '检查设备一致性错误' },
+  { value: 'positions', label: '方位一致性错误' },
+  { value: 'bodyParts', label: '部位不一致错误' },
+  { value: 'typoTerms', label: '术语不一致' },
+  { value: 'organectomys', label: '器官切除不一致错误' },
+  { value: 'sexs', label: '性别不一致错误' }
 ]
 
 const reportHeaderTitle = computed(() => {
@@ -348,6 +361,11 @@ const currentReportIndex = computed(() => {
   if (!currentReport.value) return -1
   return reportList.value.findIndex((item) => item.id === currentReport.value.id)
 })
+const showPatientSexInMeta = computed(() => {
+  if (!currentReport.value) return false
+  if (!normalizeInputText(currentReport.value.patient_sex)) return false
+  return cards.value.some((card) => card.error_type === 'sexs')
+})
 
 const visibleColumns = computed(() => {
   const selected = new Set(visibleColumnKeys.value)
@@ -358,12 +376,10 @@ watch(visibleColumnKeys, (val) => {
   localStorage.setItem(TASK_COLUMNS_STORAGE_KEY, JSON.stringify(val))
 }, { deep: true })
 
-const isAnnotated = (status) => ['SUBMITTED', 'DONE'].includes(status)
-
 const getStatusText = (status) => {
   const map = {
     ASSIGNED: '未标注',
-    IN_PROGRESS: '未标注',
+    IN_PROGRESS: '标注中',
     SUBMITTED: '已标注',
     REVIEW_ASSIGNED: '待复核',
     REVIEW_IN_PROGRESS: '复核中',
@@ -404,6 +420,16 @@ const normalizeContentType = (contentType) => {
   return ''
 }
 
+const getSectionNameByCard = (card) => {
+  const normalized = normalizeContentType(card?.content_type)
+  if (normalized === 'impression') return '诊断意见'
+  if (normalized === 'description') return '检查所见'
+  const raw = normalizeInputText(card?.content_type)
+  if (raw.includes('诊断意见')) return '诊断意见'
+  if (raw.includes('检查所见')) return '检查所见'
+  return '检查所见'
+}
+
 const normalizeIdText = (value) => {
   if (value === null || value === undefined) return ''
   const text = String(value).trim()
@@ -424,6 +450,14 @@ const riskByErrorType = (errorType) => {
   if (['bodyParts', 'examitems', 'typo_modality'].includes(errorType)) return 'medium'
   if (['typo_unit', 'organectomys', 'positions'].includes(errorType)) return 'high'
   return 'medium'
+}
+
+const normalizeImportedSeverity = (value, errorType = '') => {
+  const raw = String(value ?? '').trim().toLowerCase()
+  if (['low', 'l', '1', '低', '轻', '轻度'].includes(raw)) return 'low'
+  if (['medium', 'med', 'm', '2', '中', '中度'].includes(raw)) return 'medium'
+  if (['high', 'h', '3', '高', '重', '重度'].includes(raw)) return 'high'
+  return riskByErrorType(errorType || '')
 }
 
 const severityText = (v) => {
@@ -486,6 +520,13 @@ const buildDeleteSuggestionText = (source) => {
   const sourceText = normalizeInputText(source)
   if (!sourceText) return '建议删除'
   return `建议删除"${sourceText}"`
+}
+
+const buildReplaceSuggestionTextByCard = (card, replacementText) => {
+  const source = normalizeInputText(card.source)
+  const replacement = normalizeInputText(replacementText)
+  if (!source || !replacement) return ''
+  return `建议将"${source}"替换成"${replacement}"`
 }
 
 const buildActionSuggestionText = (card) => {
@@ -554,26 +595,18 @@ const extractPositionWord = (card) => {
   return matched?.[1] || ''
 }
 
-const extractRemovedOrgans = () => {
-  const raw = currentReport.value?.removed_organs || currentReport.value?.resected_organs || []
-  if (Array.isArray(raw) && raw.length) return raw.join('、')
-  return ''
-}
-
 const getDefaultProcessMethodByErrorType = (errorType) => PROCESS_METHOD_BY_ERROR_TYPE[errorType] || PROCESS_METHOD.delete
-
-const hasPromptTemplateByErrorType = (errorType) => !['typos'].includes(String(errorType || ''))
 
 const buildPromptSuggestionByErrorType = (card) => {
   const source = normalizeInputText(card.source)
   const modality = normalizeInputText(currentReport.value?.modality) || '当前设备'
   const bodyPart = extractBodyPart()
   const patientSex = normalizeInputText(currentReport.value?.patient_sex) || '未知'
-  const removedOrgans = extractRemovedOrgans()
+  const sectionName = getSectionNameByCard(card)
 
   switch (card.error_type) {
     case 'examitems':
-      return `"${source}"检查项目矛盾/报告漏写增强`
+      return '检查项目矛盾/报告漏写增强'
     case 'typo_unit':
       return '单位异常请检查核对'
     case 'typo_modality':
@@ -585,9 +618,7 @@ const buildPromptSuggestionByErrorType = (card) => {
     case 'typoTerms':
       return '专业术语有误'
     case 'organectomys':
-      return removedOrgans
-        ? `检查所见中，描述了与患者已记录的已切除脏器相矛盾的内容（已切除：${removedOrgans}）`
-        : '检查所见中，描述了与患者已记录的已切除脏器相矛盾的内容'
+      return `${sectionName}中，描述了与患者已记录的已切除脏器相矛盾的内容`
     case 'sexs':
       return `"${source}"与性别${patientSex}矛盾`
     default:
@@ -596,26 +627,26 @@ const buildPromptSuggestionByErrorType = (card) => {
 }
 
 const buildReplaceSuggestionByErrorType = (card, replacementText) => {
-  const source = normalizeInputText(card.source)
-  const target = normalizeInputText(replacementText)
-  if (!source || !target) return ''
-  if (card.error_type === 'typos') {
-    return `建议"${source}"替换成"${target}"`
-  }
-  return `建议将"${source}"改成"${target}"`
+  return buildReplaceSuggestionTextByCard(card, replacementText)
+}
+
+const buildReplaceBaseSuggestionByErrorType = (card) => {
+  if (card.error_type === 'typoTerms') return '专业术语有误'
+  return ''
 }
 
 const buildDeleteSuggestionByErrorType = (card) => buildDeleteSuggestionText(card.source)
 
 const buildReplaceEmptyStateSuggestion = () => '请输入替换内容'
 
-const appendWithSentencePunctuation = (prefixText, appendText) => {
-  const prefix = normalizeInputText(prefixText)
+const appendSuggestionSentence = (baseText, appendText) => {
+  const base = normalizeInputText(baseText)
   const append = normalizeInputText(appendText)
-  if (!append) return prefix
-  if (!prefix) return append
-  const suffix = /[。.!?！？]$/.test(prefix) ? '' : '。'
-  return `${prefix}${suffix}${append}`
+  if (!append) return base
+  if (!base) return append
+  if (base.includes(append)) return base
+  if (/[。.!?！？]$/.test(base)) return `${base} ${append}`
+  return `${base}。 ${append}`
 }
 
 const buildSuggestionByMethod = (card, method, options = {}) => {
@@ -630,21 +661,92 @@ const buildSuggestionByMethod = (card, method, options = {}) => {
   if (replacementText) {
     return buildReplaceSuggestionByErrorType(card, replacementText)
   }
+  const replaceBaseSuggestion = buildReplaceBaseSuggestionByErrorType(card)
+  if (replaceBaseSuggestion) return replaceBaseSuggestion
   return buildReplaceEmptyStateSuggestion()
 }
 
-const buildReplaceSuggestionWithPromptPrefix = (card, replacementText) => {
-  const replacement = normalizeInputText(replacementText)
-  if (!replacement) return buildSuggestionByMethod(card, PROCESS_METHOD.replace, { replacementText: '' })
-  const replaceText = buildReplaceSuggestionByErrorType(card, replacement)
-  const promptText = hasPromptTemplateByErrorType(card.error_type) ? buildPromptSuggestionByErrorType(card) : ''
-  if (!promptText) return replaceText
-  return appendWithSentencePunctuation(promptText, replaceText)
+const buildSuggestionByMethodWithReplacementAppend = (card, method, options = {}) => {
+  const normalizedMethod = normalizeProcessMethod(method)
+  const replacementText = normalizeInputText(options.replacementText ?? card.target)
+  if (normalizedMethod === PROCESS_METHOD.replace) {
+    return buildSuggestionByMethod(card, normalizedMethod, { replacementText })
+  }
+  const baseSuggestion = buildSuggestionByMethod(card, normalizedMethod, { replacementText: '' })
+  if (!replacementText) return baseSuggestion
+  const replacementSuggestion = buildReplaceSuggestionByErrorType(card, replacementText)
+  return appendSuggestionSentence(baseSuggestion, replacementSuggestion)
 }
 
-const buildDefaultSuggestionByErrorType = (card) => {
-  const defaultMethod = getDefaultProcessMethodByErrorType(card.error_type)
-  return buildSuggestionByMethod(card, defaultMethod, { replacementText: card.target })
+const ensureMethodSuggestionCache = (card) => {
+  if (!card || typeof card !== 'object') return {}
+  if (!card._methodSuggestionCache || typeof card._methodSuggestionCache !== 'object') {
+    card._methodSuggestionCache = {}
+  }
+  return card._methodSuggestionCache
+}
+
+const getCachedSuggestionByMethod = (card, method) => {
+  const cache = ensureMethodSuggestionCache(card)
+  return normalizeInputText(cache[normalizeProcessMethod(method)])
+}
+
+const setCachedSuggestionByMethod = (card, method, suggestionText) => {
+  const cache = ensureMethodSuggestionCache(card)
+  const key = normalizeProcessMethod(method)
+  const text = normalizeInputText(suggestionText)
+  if (text) {
+    cache[key] = text
+  } else {
+    delete cache[key]
+  }
+}
+
+const normalizeOrganectomySuggestionSection = (card) => {
+  if (!card || card.error_type !== 'organectomys') return
+  const message = normalizeInputText(card.alert_message)
+  if (!message) return
+  const template = /^(检查所见|诊断意见)中，描述了与患者已记录的已切除脏器相矛盾的内容$/
+  if (!template.test(message)) return
+  const normalized = `${getSectionNameByCard(card)}中，描述了与患者已记录的已切除脏器相矛盾的内容`
+  if (message !== normalized) {
+    card.alert_message = normalized
+  }
+}
+
+const buildSuggestionByMethodWithCachedBase = (card, method, options = {}) => {
+  const normalizedMethod = normalizeProcessMethod(method)
+  const replacementText = normalizeInputText(options.replacementText ?? card.target)
+  const preservedPromptBase = getCachedSuggestionByMethod(card, PROCESS_METHOD.prompt)
+
+  if (card?._preserveBaseSuggestion && preservedPromptBase) {
+    if (normalizedMethod === PROCESS_METHOD.prompt) {
+      return preservedPromptBase
+    }
+    if (normalizedMethod === PROCESS_METHOD.delete) {
+      return appendSuggestionSentence(preservedPromptBase, buildDeleteSuggestionByErrorType(card))
+    }
+    if (!replacementText) {
+      return preservedPromptBase
+    }
+    return appendSuggestionSentence(
+      preservedPromptBase,
+      buildReplaceSuggestionByErrorType(card, replacementText)
+    )
+  }
+
+  const cachedBase = getCachedSuggestionByMethod(card, normalizedMethod)
+  if (!replacementText) {
+    if (cachedBase) return cachedBase
+    return buildSuggestionByMethodWithReplacementAppend(card, normalizedMethod, { replacementText: '' })
+  }
+  if (normalizedMethod === PROCESS_METHOD.replace) {
+    return buildReplaceSuggestionByErrorType(card, replacementText)
+  }
+  if (cachedBase) {
+    return appendSuggestionSentence(cachedBase, buildReplaceSuggestionByErrorType(card, replacementText))
+  }
+  return buildSuggestionByMethodWithReplacementAppend(card, normalizedMethod, { replacementText })
 }
 
 const enforceSuggestionLengthLimit = (card) => {
@@ -811,9 +913,6 @@ const applyDefaultSeverity = (card) => {
 
 const applyProcessMethodInputState = (card) => {
   card.process_method = normalizeProcessMethod(card.process_method)
-  if (card.process_method === PROCESS_METHOD.delete) {
-    card.target = ''
-  }
   syncActionToAlertType(card)
 }
 
@@ -827,9 +926,11 @@ const applyRuleBBySuggestion = (card) => {
 
 const resetCardByErrorType = (card) => {
   card.manual_override = false
+  card._methodSuggestionCache = {}
   card.target = ''
   card.process_method = getDefaultProcessMethodByErrorType(card.error_type)
   card.alert_message = buildSuggestionByMethod(card, card.process_method, { replacementText: '' })
+  setCachedSuggestionByMethod(card, card.process_method, card.alert_message)
   enforceSuggestionLengthLimit(card)
   applyProcessMethodInputState(card)
 }
@@ -840,44 +941,55 @@ const handleErrorTypeChange = (card) => {
 }
 
 const handleManualProcessMethodSelect = (card, method) => {
-  card.process_method = normalizeProcessMethod(method)
+  const nextMethod = normalizeProcessMethod(method)
+  const currentMethod = normalizeProcessMethod(card.process_method)
+  if (nextMethod === currentMethod) return
+  const previousSuggestion = normalizeInputText(card.alert_message)
+  if (previousSuggestion) {
+    setCachedSuggestionByMethod(card, currentMethod, previousSuggestion)
+  }
+  card.process_method = nextMethod
   card.manual_override = true
   applyProcessMethodInputState(card)
-  if (card.process_method !== PROCESS_METHOD.replace) {
-    card.target = ''
+  card.alert_message = buildSuggestionByMethodWithCachedBase(card, card.process_method, {
+    replacementText: card.target
+  })
+  if (card.process_method !== PROCESS_METHOD.replace || normalizeInputText(card.target)) {
+    card._targetValidationError = ''
   }
-  card.alert_message = buildSuggestionByMethod(card, card.process_method, { replacementText: card.target })
+  setCachedSuggestionByMethod(card, card.process_method, card.alert_message)
   enforceSuggestionLengthLimit(card)
 }
 
 const handleReplacementInput = (card) => {
   card.target = String(card.target || '')
+  card._targetValidationError = ''
+}
+
+const handleReplacementFocus = (_card) => {
+  // 保持当前处理方式不变；在 blur 阶段根据替换内容重算建议说明。
+}
+
+const handleReplacementBlur = (card) => {
   const replacement = normalizeInputText(card.target)
-  if (replacement) {
-    card.manual_override = false
-    card.process_method = PROCESS_METHOD.replace
-    card.alert_message = buildReplaceSuggestionWithPromptPrefix(card, replacement)
-    enforceSuggestionLengthLimit(card)
-    syncActionToAlertType(card)
-    return
-  }
-  if (card.process_method === PROCESS_METHOD.replace) {
-    const defaultMethod = getDefaultProcessMethodByErrorType(card.error_type)
-    if (defaultMethod === PROCESS_METHOD.replace) {
-      card.alert_message = buildReplaceEmptyStateSuggestion()
-    } else {
-      card.alert_message = buildSuggestionByMethod(card, PROCESS_METHOD.prompt, { replacementText: '' })
-      card.process_method = PROCESS_METHOD.prompt
-    }
-    enforceSuggestionLengthLimit(card)
-  }
+  card.manual_override = true
+  card.alert_message = buildSuggestionByMethodWithCachedBase(card, card.process_method, {
+    replacementText: replacement
+  })
+  enforceSuggestionLengthLimit(card)
   syncActionToAlertType(card)
 }
 
 const handleSuggestionInput = (card) => {
+  const prevMethod = normalizeProcessMethod(card.process_method)
   card.alert_message = String(card.alert_message || '')
   enforceSuggestionLengthLimit(card)
+  setCachedSuggestionByMethod(card, prevMethod, card.alert_message)
   applyRuleBBySuggestion(card)
+  const nextMethod = normalizeProcessMethod(card.process_method)
+  if (nextMethod !== prevMethod) {
+    setCachedSuggestionByMethod(card, nextMethod, card.alert_message)
+  }
 }
 
 const getReportTextByField = (field) => {
@@ -1093,25 +1205,35 @@ const buildPayload = () => {
 }
 
 const loadProgress = async () => {
-  const params = { tab: 'all', page: 1, page_size: 1000, only_mine: onlyMine.value }
-  if (reportQuery.value) params.q = reportQuery.value
+  const baseParams = {
+    page: 1,
+    page_size: 1,
+    only_mine: props.isAdminMode ? false : onlyMine.value,
+    lite: true
+  }
+  if (reportQuery.value) baseParams.q = reportQuery.value
 
-  const all = await api.getDoctorReports(params)
-  const done = all.items.filter((item) => isAnnotated(item.status)).length
-  progress.value = { done, total: all.total }
+  const [all, annotated] = await Promise.all([
+    api.getDoctorReports({ ...baseParams, tab: 'all' }),
+    api.getDoctorReports({ ...baseParams, tab: 'annotated' })
+  ])
+
+  progress.value = { done: annotated.total || 0, total: all.total || 0 }
 }
 
 const loadReports = async () => {
   const params = {
     tab: activeFilter.value,
     page: 1,
-    page_size: 1000,
-    only_mine: props.isAdminMode ? false : onlyMine.value
+    page_size: DOCTOR_LIST_PAGE_SIZE,
+    only_mine: props.isAdminMode ? false : onlyMine.value,
+    lite: true
   }
   if (reportQuery.value) params.q = reportQuery.value
 
   const res = await api.getDoctorReports(params)
   reportList.value = res.items
+  reportTotal.value = res.total || 0
 
   await loadProgress()
 
@@ -1119,7 +1241,13 @@ const loadReports = async () => {
     const preferred = props.initialReportId
       ? reportList.value.find((item) => item.id === props.initialReportId)
       : null
-    await openReport(preferred || reportList.value[0])
+    if (preferred) {
+      await openReport(preferred)
+    } else if (props.initialReportId) {
+      await openReport({ id: props.initialReportId })
+    } else {
+      await openReport(reportList.value[0])
+    }
     return
   }
 
@@ -1147,6 +1275,9 @@ const buildPreCards = (report) => {
       return preRisNo === reportRisNo
     })
     .map((item, idx) => {
+      const importedSuggestion = normalizeInputText(
+        item.alert_message || item.alert_msg || item.description || item.suggestion_message || item.suggestion_note || ''
+      )
       const card = {
         id: `pre-${report.id}-${idx}`,
         kind: 'pre',
@@ -1156,24 +1287,27 @@ const buildPreCards = (report) => {
         source: item.source || '',
         target: item.target || '',
         alert_type: String(item.alert_type ?? '2'),
-        alert_message: item.alert_message || item.alert_msg || '',
+        alert_message: item.alert_message || item.alert_msg || item.description || item.suggestion_message || item.suggestion_note || '',
         error_type: item.err_type || 'typos',
-        severity: riskByErrorType(item.err_type || 'typos'),
+        severity: normalizeImportedSeverity(item.error_level || item.severity, item.err_type || 'typos'),
         source_in_start: item.source_in_start,
         source_in_end: item.source_in_end,
         process_method: PROCESS_METHOD.prompt,
         manual_override: false,
-        action: 'prompt'
+        action: 'prompt',
+        _preserveBaseSuggestion: !!importedSuggestion
       }
       card.process_method = normalizeProcessMethod(item.process_method || inferProcessMethodFromImportedData(card))
-      if (card.process_method === PROCESS_METHOD.delete) {
-        card.target = ''
-      }
       if (!card.alert_message) {
-        card.alert_message = buildSuggestionByMethod(card, card.process_method, { replacementText: card.target })
+        card.alert_message = buildSuggestionByMethodWithReplacementAppend(card, card.process_method, { replacementText: card.target })
       }
       enforceSuggestionLengthLimit(card)
       syncActionToAlertType(card)
+      normalizeOrganectomySuggestionSection(card)
+      if (importedSuggestion) {
+        setCachedSuggestionByMethod(card, PROCESS_METHOD.prompt, importedSuggestion)
+      }
+      setCachedSuggestionByMethod(card, card.process_method, card.alert_message)
 
       const dedupKey = [
         normalizeContentType(card.content_type),
@@ -1198,6 +1332,7 @@ const buildManualCardsFromAnnotation = (report) => {
   if (!annotation?.error_items?.length) return []
 
   return annotation.error_items.map((item, idx) => {
+    const importedSuggestion = normalizeInputText(item.description || '')
     const anchorKind = item.anchor?.kind
     const anchorState = item.anchor?.state
     const isPendingPre = anchorKind === 'pre' && anchorState === 'pending'
@@ -1213,22 +1348,28 @@ const buildManualCardsFromAnnotation = (report) => {
       alert_type: String(item.anchor?.alert_type ?? '2'),
       alert_message: item.description || '',
       error_type: item.error_type || 'typos',
-      severity: item.severity || riskByErrorType(item.error_type || 'typos'),
+      severity: normalizeImportedSeverity(item.severity || item.error_level, item.error_type || 'typos'),
       source_in_start: item.anchor?.source_in_start,
       source_in_end: item.anchor?.source_in_end,
       process_method: normalizeProcessMethod(rawProcessMethod),
       manual_override: false,
-      action: normalizeAction(item.anchor?.action)
+      action: normalizeAction(item.anchor?.action),
+      _preserveBaseSuggestion: !!importedSuggestion
     }
 
     if (!normalizeInputText(rawProcessMethod)) {
       card.process_method = inferProcessMethodFromImportedData(card)
     }
     if (!normalizeInputText(card.alert_message)) {
-      card.alert_message = buildSuggestionByMethod(card, card.process_method, { replacementText: card.target })
+      card.alert_message = buildSuggestionByMethodWithReplacementAppend(card, card.process_method, { replacementText: card.target })
     }
     enforceSuggestionLengthLimit(card)
     syncActionToAlertType(card)
+    normalizeOrganectomySuggestionSection(card)
+    if (importedSuggestion) {
+      setCachedSuggestionByMethod(card, PROCESS_METHOD.prompt, importedSuggestion)
+    }
+    setCachedSuggestionByMethod(card, card.process_method, card.alert_message)
     return card
   })
 }
@@ -1321,8 +1462,10 @@ const editCard = (card) => {
   card.process_method = normalizeProcessMethod(card.process_method || actionToProcessMethod(card.action))
   card.manual_override = !!card.manual_override
   if (!card.alert_message) {
-    card.alert_message = buildSuggestionByMethod(card, card.process_method, { replacementText: card.target })
+    card.alert_message = buildSuggestionByMethodWithReplacementAppend(card, card.process_method, { replacementText: card.target })
   }
+  card._targetValidationError = ''
+  setCachedSuggestionByMethod(card, card.process_method, card.alert_message)
   applyProcessMethodInputState(card)
   card._backup = { ...card }
   card.state = 'editing'
@@ -1336,36 +1479,23 @@ const prepareCardForSave = async (card, options = {}) => {
   card.alert_message = normalizeInputText(card.alert_message)
   card.process_method = normalizeProcessMethod(card.process_method)
   card.manual_override = !!card.manual_override
+  card._targetValidationError = ''
   enforceSuggestionLengthLimit(card)
   applyDefaultSeverity(card)
 
+  // 保存时若填写了替换内容，则处理方式自动切换为“替换”。
   if (card.target) {
     card.process_method = PROCESS_METHOD.replace
-    card.alert_message = buildReplaceSuggestionWithPromptPrefix(card, card.target)
-  } else if (card.process_method === PROCESS_METHOD.replace) {
-    const defaultMethod = getDefaultProcessMethodByErrorType(card.error_type)
-    if (defaultMethod === PROCESS_METHOD.replace) {
-      card.alert_message = buildReplaceEmptyStateSuggestion()
-    } else {
-      card.process_method = PROCESS_METHOD.prompt
-      card.alert_message = buildSuggestionByMethod(card, PROCESS_METHOD.prompt, { replacementText: '' })
-    }
-  } else {
-    card.target = ''
   }
 
-  applyRuleBBySuggestion(card)
-
   if (card.process_method === PROCESS_METHOD.replace && !normalizeInputText(card.target)) {
-    if (showValidationDialog) {
-      ElMessage.warning('请填写替换内容')
-    }
+    card._targetValidationError = '请填写替换内容'
     return false
   }
 
   if (!card.alert_message) {
     if (allowAutoSuggestionWhenEmpty) {
-      card.alert_message = buildSuggestionByMethod(card, card.process_method, { replacementText: card.target })
+      card.alert_message = buildSuggestionByMethodWithReplacementAppend(card, card.process_method, { replacementText: card.target })
     } else {
       if (showValidationDialog) {
         ElMessage.warning('请填写建议说明')
@@ -1374,9 +1504,6 @@ const prepareCardForSave = async (card, options = {}) => {
     }
   }
 
-  if (card.process_method !== PROCESS_METHOD.replace) {
-    card.target = ''
-  }
   enforceSuggestionLengthLimit(card)
   syncActionToAlertType(card)
 
@@ -1403,24 +1530,25 @@ const cancelEdit = (card) => {
   card._backup = null
 }
 
-const revokeCard = async (card) => {
+const deleteCard = async (card) => {
   if (!currentReport.value) return
   try {
     await ElMessageBox.confirm(
-      '撤销后将删除当前纠错卡片，是否继续？',
-      '撤销确认',
-      { confirmButtonText: '确认撤销', cancelButtonText: '返回', type: 'warning' }
+      '删除后将放弃对此选中文本的标注，是否继续？',
+      '删除确认',
+      { confirmButtonText: '确认删除', cancelButtonText: '返回', type: 'warning' }
     )
   } catch (_e) {
     return
   }
 
+  clearHighlightFocus()
   if (card.kind === 'pre' || card.origin_kind === 'pre') {
     markPreCardDismissed(currentReport.value.id, card)
   }
   cards.value = cards.value.filter((item) => item.id !== card.id)
   if (selectedCardId.value === card.id) {
-    selectedCardId.value = cards.value[0]?.id || null
+    selectedCardId.value = null
   }
   await autoSaveAfterInteraction()
 }
@@ -1453,38 +1581,46 @@ const createManualCardFromSelection = () => {
   }
   const selectedText = selectedTextRaw
 
-  const anchorEl = selection.anchorNode?.parentElement
-  const fieldBlock = anchorEl?.closest('[data-field]')
+  const range = selection.rangeCount > 0 ? selection.getRangeAt(0) : null
+  const anchorEl = selection.anchorNode?.nodeType === Node.ELEMENT_NODE
+    ? selection.anchorNode
+    : selection.anchorNode?.parentElement
+  const commonAncestorEl = range
+    ? (range.commonAncestorContainer?.nodeType === Node.ELEMENT_NODE
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer?.parentElement)
+    : null
+  const fieldBlock = commonAncestorEl?.closest('[data-field]') || anchorEl?.closest('[data-field]')
   const field = fieldBlock?.dataset?.field || 'description'
   const contentEl = fieldBlock?.querySelector('.section-content') || null
-  const range = selection.rangeCount > 0 ? selection.getRangeAt(0) : null
 
   const shouldSkipNode = (textNode) => {
     const parent = textNode?.parentElement
     if (!parent) return true
-    return !!parent.closest('.hl-mark, .hl-prompt-icon')
+    return !!parent.closest('.hl-mark, .hl-prompt-icon, .hl-prompt-triangle')
   }
 
-  const computeOffsetByTextNode = (rootEl, targetNode, targetOffset) => {
-    if (!rootEl || !targetNode || targetNode.nodeType !== Node.TEXT_NODE) return null
-    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT)
-    let total = 0
-    while (walker.nextNode()) {
-      const node = walker.currentNode
-      if (shouldSkipNode(node)) continue
-      if (node === targetNode) {
-        return total + Math.min(targetOffset, node.textContent?.length || 0)
-      }
-      total += node.textContent?.length || 0
+  const computeOffsetByBoundary = (rootEl, boundaryNode, boundaryOffset) => {
+    if (!rootEl || !boundaryNode) return null
+    try {
+      const offsetRange = document.createRange()
+      offsetRange.setStart(rootEl, 0)
+      offsetRange.setEnd(boundaryNode, boundaryOffset)
+      const fragment = offsetRange.cloneContents()
+      const container = document.createElement('div')
+      container.appendChild(fragment)
+      container.querySelectorAll('.hl-mark, .hl-prompt-icon, .hl-prompt-triangle').forEach((el) => el.remove())
+      return container.textContent?.length ?? 0
+    } catch (_e) {
+      return null
     }
-    return null
   }
 
   let sourceInStart = null
   let sourceInEnd = null
   if (range && contentEl && contentEl.contains(range.startContainer) && contentEl.contains(range.endContainer)) {
-    const startOffset = computeOffsetByTextNode(contentEl, range.startContainer, range.startOffset)
-    const endOffset = computeOffsetByTextNode(contentEl, range.endContainer, range.endOffset)
+    const startOffset = computeOffsetByBoundary(contentEl, range.startContainer, range.startOffset)
+    const endOffset = computeOffsetByBoundary(contentEl, range.endContainer, range.endOffset)
     if (Number.isInteger(startOffset) && Number.isInteger(endOffset) && endOffset > startOffset) {
       sourceInStart = startOffset
       sourceInEnd = endOffset
@@ -1510,7 +1646,8 @@ const createManualCardFromSelection = () => {
     manual_override: false,
     action: 'replace'
   }
-  newCard.alert_message = buildDefaultSuggestionByErrorType(newCard)
+  // 手动新建卡片时保持建议说明为空，显示输入框 placeholder“建议说明”。
+  newCard.alert_message = ''
   enforceSuggestionLengthLimit(newCard)
   syncActionToAlertType(newCard)
 
@@ -1656,6 +1793,15 @@ const submitReport = async () => {
 
   const previousReportId = currentReport.value.id
   const previousIndex = currentReportIndex.value
+  const targetReportIdByCurrentOrder = (() => {
+    if (!reportList.value.length) return null
+    const baseIdx = reportList.value.findIndex((item) => item.id === previousReportId)
+    if (baseIdx < 0) return null
+    if (!autoGoNextAfterSubmit.value) return previousReportId
+    const nextIdx = (baseIdx + 1 + reportList.value.length) % reportList.value.length
+    return reportList.value[nextIdx]?.id || null
+  })()
+
   submitting.value = true
   try {
     await api.submitAnnotation(currentReport.value.id, buildPayload())
@@ -1663,7 +1809,10 @@ const submitReport = async () => {
     await loadReports()
 
     const offset = autoGoNextAfterSubmit.value ? 1 : 0
-    const targetReport = resolveReportAfterSubmit(previousReportId, previousIndex, offset)
+    const targetReport =
+      reportList.value.find((item) => item.id === targetReportIdByCurrentOrder) ||
+      resolveReportAfterSubmit(previousReportId, previousIndex, offset)
+
     if (targetReport) {
       await openReport(targetReport)
     } else {
@@ -1703,6 +1852,11 @@ const cancelSubmittedAnnotation = async () => {
     const refreshed = reportList.value.find((item) => item.id === reportId)
     if (refreshed) {
       await openReport(refreshed)
+    } else if (currentReport.value) {
+      // loadReports() 在当前报告不在列表时会自动切换到第一条，这里保持该结果即可。
+      doctorTableRef.value?.setCurrentRow(currentReport.value)
+    } else if (reportList.value.length > 0) {
+      await openReport(reportList.value[0])
     } else {
       clearCurrentReport()
     }
@@ -1763,7 +1917,7 @@ onMounted(async () => {
   display: grid;
   grid-template-columns: 360px 1fr 380px;
   gap: 12px;
-  height: calc(100vh - 130px);
+  height: calc(100vh - 170px);
 }
 
 .left-panel,
@@ -1887,6 +2041,10 @@ onMounted(async () => {
 
 .sheet-head h2 {
   margin: 0 0 4px 0;
+}
+
+.sheet-meta-line {
+  margin-top: 2px;
 }
 
 .sheet-body {
@@ -2088,6 +2246,18 @@ onMounted(async () => {
 
 .replace-target-input :deep(.el-input__wrapper) {
   box-shadow: 0 0 0 1px #f59e0b inset;
+}
+
+.replace-target-input-error :deep(.el-input__wrapper) {
+  box-shadow: 0 0 0 1px #ef4444 inset;
+}
+
+.card-inline-error {
+  margin-top: -4px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #ef4444;
 }
 
 .card-actions {

@@ -1,7 +1,8 @@
 from typing import Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from sqlalchemy import case
+from sqlalchemy.orm import Session, load_only
 from ...core.database import get_db
 from ...models.user import User
 from ...models.report import Report
@@ -31,6 +32,7 @@ def list_doctor_reports(
     q: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=1000),
+    lite: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(["doctor", "admin"]))
 ):
@@ -48,14 +50,41 @@ def list_doctor_reports(
             Report.is_cancel == False
         )
 
+    if lite:
+        query = query.options(load_only(
+            Report.id,
+            Report.external_id,
+            Report.ris_no,
+            Report.imported_at,
+            Report.modality,
+            Report.patient_name,
+            Report.patient_sex,
+            Report.patient_age,
+            Report.exam_item,
+            Report.exam_mode,
+            Report.exam_group,
+            Report.status,
+            Report.assigned_doctor_id,
+            Report.assigned_at,
+            Report.annotator_doctor_id,
+            Report.reviewer_doctor_id,
+            Report.review_assigned_at,
+            Report.reviewed_at,
+            Report.submitted_at,
+        ))
+
+    annotated_statuses = [STATUS_SUBMITTED, STATUS_DONE]
+
     # 按 tab 筛选状态
     if tab == "unannotated":
         query = query.filter(Report.status.in_([STATUS_ASSIGNED, STATUS_IN_PROGRESS, STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS]))
     elif tab == "annotated":
-        query = query.filter(Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]))
+        query = query.filter(Report.status.in_(annotated_statuses))
     elif tab == "no_error":
-        # 需要通过 annotation 判断 no_error
-        query = query.filter(Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]))
+        query = query.join(Annotation, Annotation.report_id == Report.id).filter(
+            Report.status.in_(annotated_statuses),
+            Annotation.data.contains({"no_error": True})
+        ).distinct(Report.id)
 
     if q:
         query = query.filter(
@@ -64,24 +93,31 @@ def list_doctor_reports(
             (Report.report_text.ilike(f"%{q}%"))
         )
 
-    all_reports = query.all()
+    if tab == "all":
+        query = query.order_by(
+            case((Report.status.in_(annotated_statuses), 1), else_=0),
+            Report.id.asc()
+        )
+    else:
+        query = query.order_by(Report.id.asc())
 
-    # 获取每个报告的标注
-    items = []
-    for report in all_reports:
-        annotation_query = db.query(Annotation).filter(Annotation.report_id == report.id)
-        annotation = annotation_query.first()
+    total = query.count()
+    paged_reports = query.offset((page - 1) * page_size).limit(page_size).all()
 
-        # tab == no_error 时过滤
-        if tab == "no_error" and annotation:
-            if not annotation.data.get("no_error", False):
-                continue
+    annotation_by_report_id = {}
+    if paged_reports and not lite:
+        report_ids = [report.id for report in paged_reports]
+        annotation_rows = db.query(Annotation).filter(Annotation.report_id.in_(report_ids)).all()
+        annotation_by_report_id = {annotation.report_id: annotation for annotation in annotation_rows}
 
-        items.append(DoctorReportResponse(
+    paged_items = []
+    for report in paged_reports:
+        annotation = annotation_by_report_id.get(report.id) if not lite else None
+        paged_items.append(DoctorReportResponse(
             id=report.id,
             external_id=report.external_id,
             ris_no=report.ris_no,
-            report_text=report.report_text,
+            report_text=(report.report_text or "") if not lite else "",
             imported_at=report.imported_at,
             modality=report.modality,
             patient_name=report.patient_name,
@@ -90,8 +126,8 @@ def list_doctor_reports(
             exam_item=report.exam_item,
             exam_mode=report.exam_mode,
             exam_group=report.exam_group,
-            description=report.description,
-            impression=report.impression,
+            description=None if lite else report.description,
+            impression=None if lite else report.impression,
             status=report.status,
             assigned_doctor_id=report.assigned_doctor_id,
             assigned_at=report.assigned_at,
@@ -100,23 +136,9 @@ def list_doctor_reports(
             review_assigned_at=report.review_assigned_at,
             reviewed_at=report.reviewed_at,
             submitted_at=report.submitted_at,
-            pre_annotations=report.pre_annotations,
+            pre_annotations=None if lite else report.pre_annotations,
             annotation=annotation
         ))
-
-    def is_annotated(item: DoctorReportResponse) -> bool:
-        return item.status in [STATUS_SUBMITTED, STATUS_DONE]
-
-    # 全部列表中将已标注放到底部，未标注优先
-    if tab == "all":
-        items.sort(key=lambda x: (1 if is_annotated(x) else 0, x.id))
-    else:
-        items.sort(key=lambda x: x.id)
-
-    total = len(items)
-    start = (page - 1) * page_size
-    end = start + page_size
-    paged_items = items[start:end]
 
     return DoctorReportListResponse(
         items=paged_items,

@@ -35,7 +35,7 @@
         <el-button
           type="danger"
           @click="batchDelete"
-          :disabled="selectedReports.length === 0"
+          :disabled="!canBatchDelete"
         >
           批量删除 ({{ selectedReports.length }})
         </el-button>
@@ -93,7 +93,6 @@
               >查看</el-button
             >
             <el-button
-              v-if="row.status === 'IMPORTED'"
               link
               type="danger"
               @click="deleteReport(row)"
@@ -256,7 +255,21 @@
 
     <!-- 分发弹窗 -->
     <el-dialog v-model="showAssignModal" title="分发报告给医生" width="760px">
-      <p>系统会自动优先分发待标注报告；若无可分配标注任务，则自动分发已提交报告进入复核。</p>
+      <div style="margin-bottom: 12px">
+        <el-radio-group v-model="assignDispatchMode">
+          <el-radio label="annotation">首次分配（标注）</el-radio>
+          <el-radio label="review">复核分配</el-radio>
+        </el-radio-group>
+      </div>
+      <div style="margin-bottom: 12px">
+        <el-radio-group v-model="assignScope">
+          <el-radio label="selected">仅分配勾选报告（推荐）</el-radio>
+          <el-radio label="all">分配当前筛选全部报告</el-radio>
+        </el-radio-group>
+      </div>
+      <div style="margin-bottom: 12px; color: #6b7280; font-size: 12px">
+        当前已勾选：{{ selectedReports.length }} 条（{{ assignSelectionHint }}）
+      </div>
       <el-transfer
         v-model="assignDoctorIds"
         :data="doctorTransferData"
@@ -338,6 +351,7 @@ const reportPage = ref(1);
 const reportPageSize = ref(10);
 const reportTotal = ref(0);
 const selectedReports = ref([]);
+const selectedReportStatusMap = ref({});
 const isRestoringSelection = ref(false); // 标记是否正在恢复选中状态
 
 // 导入
@@ -359,6 +373,8 @@ const showAssignModal = ref(false);
 const showWorkbenchDialog = ref(false);
 const currentWorkbenchReportId = ref(null);
 const assignDoctorIds = ref([]);
+const assignScope = ref("selected");
+const assignDispatchMode = ref("annotation");
 const doctorTransferData = computed(() =>
   doctors.value.map((doctor) => ({
     key: doctor.id,
@@ -367,11 +383,21 @@ const doctorTransferData = computed(() =>
       : doctor.username,
   })),
 );
+const canBatchDelete = computed(() => {
+  return selectedReports.value.length > 0;
+});
+const assignSelectionHint = computed(() => {
+  if (assignDispatchMode.value === "review") {
+    return "分配时仅支持“已提交”，不满足条件会提示";
+  }
+  return "分配时仅支持“待分发”或“已分发未开始”，不满足条件会提示";
+});
 
 // 方法
 const handleStatusChange = () => {
   reportPage.value = 1;
   selectedReports.value = [];
+  selectedReportStatusMap.value = {};
   loadReports();
 };
 
@@ -379,8 +405,8 @@ const tableIndex = (index) => {
   return (reportPage.value - 1) * reportPageSize.value + index + 1;
 };
 
-const checkSelectable = (row) => {
-  return row.status === "IMPORTED";
+const checkSelectable = (_row) => {
+  return true;
 };
 
 const handleSelectionChange = (selection) => {
@@ -389,9 +415,9 @@ const handleSelectionChange = (selection) => {
     return;
   }
 
-  // 获取当前页的IMPORTED记录ID
+  // 获取当前页允许勾选的记录 ID
   const currentPageIds = reports.value
-    .filter((r) => r.status === "IMPORTED")
+    .filter((r) => checkSelectable(r))
     .map((r) => r.id);
 
   // 从selectedReports中移除当前页的所有ID
@@ -401,10 +427,21 @@ const handleSelectionChange = (selection) => {
 
   // 添加当前页选中的ID
   const selectedIds = selection
-    .filter((r) => r.status === "IMPORTED")
+    .filter((r) => checkSelectable(r))
     .map((r) => r.id);
 
   selectedReports.value = [...prevSelected, ...selectedIds];
+
+  const currentPageStatusMap = new Map(reports.value.map((r) => [r.id, r.status]));
+  const nextStatusMap = {};
+  selectedReports.value.forEach((id) => {
+    if (currentPageStatusMap.has(id)) {
+      nextStatusMap[id] = currentPageStatusMap.get(id);
+    } else if (selectedReportStatusMap.value[id]) {
+      nextStatusMap[id] = selectedReportStatusMap.value[id];
+    }
+  });
+  selectedReportStatusMap.value = nextStatusMap;
 };
 
 const loadReports = async () => {
@@ -422,7 +459,7 @@ const loadReports = async () => {
     tableRef.value?.clearSelection();
 
     // 然后根据 selectedReports 恢复当前页的选中状态
-    const importableRows = reports.value.filter((r) => r.status === "IMPORTED");
+    const importableRows = reports.value.filter((r) => checkSelectable(r));
     importableRows.forEach((row) => {
       if (selectedReports.value.includes(row.id)) {
         tableRef.value?.toggleRowSelection(row, true);
@@ -476,6 +513,8 @@ const openAssignModal = async () => {
     return;
   }
   assignDoctorIds.value = [];
+  assignScope.value = "selected";
+  assignDispatchMode.value = reportStatus.value === "SUBMITTED" ? "review" : "annotation";
   showAssignModal.value = true;
 };
 
@@ -492,7 +531,51 @@ const pollTask = async (taskId) => {
 const handleAssign = async () => {
   try {
     const doctorMap = new Map(doctors.value.map((doctor) => [doctor.id, doctor.username]));
-    const res = await api.assignReports([], null, assignDoctorIds.value, "auto");
+    const selectedIds = [...new Set(selectedReports.value)];
+    let payload = null;
+
+    if (assignScope.value === "selected") {
+      if (selectedIds.length === 0) {
+        ElMessage.warning("请先勾选要分配的报告");
+        return;
+      }
+      payload = {
+        mode: "selected",
+        reportIds: selectedIds,
+        doctorIds: assignDoctorIds.value,
+        dispatchMode: assignDispatchMode.value,
+      };
+    } else {
+      try {
+        const allModeStatus = reportStatus.value || "";
+        const modeText = assignDispatchMode.value === "review" ? "复核分配" : "首次分配";
+        const allModeHint = reportStatus.value
+          ? `当前筛选状态为“${getStatusText(reportStatus.value)}”，将执行${modeText}`
+          : `当前未选择状态筛选，将按当前查询范围执行${modeText}`;
+        await ElMessageBox.confirm(
+          `${allModeHint}，是否继续全量分配？`,
+          "分配确认",
+          {
+            confirmButtonText: "确定",
+            cancelButtonText: "取消",
+            type: "warning",
+            closeOnClickModal: false,
+          },
+        );
+        payload = {
+          mode: "all",
+          assignAll: true,
+          q: reportQuery.value,
+          status: allModeStatus,
+          doctorIds: assignDoctorIds.value,
+          dispatchMode: assignDispatchMode.value,
+        };
+      } catch (_e) {
+        return;
+      }
+    }
+
+    const res = await api.assignReports(payload);
     if (!res.assigned) {
       ElMessage.warning("没有可分配的报告");
       return;
@@ -509,6 +592,8 @@ const handleAssign = async () => {
     );
     showAssignModal.value = false;
     selectedReports.value = [];
+    selectedReportStatusMap.value = {};
+    tableRef.value?.clearSelection();
     assignDoctorIds.value = [];
     loadReports();
   } catch (e) {
@@ -519,6 +604,50 @@ const handleAssign = async () => {
 const viewReport = async (r) => {
   currentWorkbenchReportId.value = r.id;
   showWorkbenchDialog.value = true;
+};
+
+const chooseSubmittedOrDoneScope = async () => {
+  try {
+    await ElMessageBox.confirm(
+      "请选择状态范围：\n1) 仅导出已提交\n2) 仅导出已完成",
+      "状态范围",
+      {
+        confirmButtonText: "仅已提交",
+        cancelButtonText: "仅已完成",
+        distinguishCancelAndClose: true,
+        closeOnClickModal: true,
+        closeOnPressEscape: true,
+      },
+    );
+    return "submitted";
+  } catch (action) {
+    if (action === "cancel") {
+      return "done";
+    }
+    return null;
+  }
+};
+
+const chooseExportScope = async () => {
+  try {
+    await ElMessageBox.confirm(
+      "请选择导出范围：\n1) 导出所有报告\n2) 按状态导出（已提交/已完成）",
+      "导出范围",
+      {
+        confirmButtonText: "导出所有",
+        cancelButtonText: "按状态导出",
+        distinguishCancelAndClose: true,
+        closeOnClickModal: true,
+        closeOnPressEscape: true,
+      },
+    );
+    return "all";
+  } catch (action) {
+    if (action === "cancel") {
+      return await chooseSubmittedOrDoneScope();
+    }
+    return null;
+  }
 };
 
 const chooseExportMode = async () => {
@@ -560,9 +689,14 @@ const downloadExportBlob = (blob, extension) => {
 
 const handleExportAllReports = async () => {
   try {
+    const exportScope = await chooseExportScope();
+    if (!exportScope) return;
     const exportMode = await chooseExportMode();
     if (!exportMode) return;
-    const blob = await api.exportAllReports({ export_mode: exportMode });
+    const blob = await api.exportAllReports({
+      export_mode: exportMode,
+      export_scope: exportScope,
+    });
     const extension = exportMode === "zip" ? "zip" : "xlsx";
     downloadExportBlob(blob, extension);
     ElMessage.success("导出成功");
@@ -644,13 +778,15 @@ const deleteUser = async (user) => {
 
 const deleteReport = async (r) => {
   try {
+    const statusText = getStatusText(r.status);
     await ElMessageBox.confirm(
-      `确定要删除检查号 "${r.ris_no || r.external_id || r.id}" 吗？`,
-      "提示",
+      `确定要删除检查号 "${r.ris_no || r.external_id || r.id}" 吗？\n当前报告状态为“${statusText}”，删除会导致数据丢失，标注任务不能正常进行，是否确认删除？`,
+      "删除确认",
       { confirmButtonText: "确定", cancelButtonText: "取消", type: "warning" },
     );
     await api.deleteReport(r.id);
     selectedReports.value = selectedReports.value.filter((id) => id !== r.id);
+    delete selectedReportStatusMap.value[r.id];
     const nextTotal = Math.max(0, reportTotal.value - 1);
     const maxPage = Math.max(1, Math.ceil(nextTotal / reportPageSize.value));
     reportTotal.value = nextTotal;
@@ -666,18 +802,26 @@ const deleteReport = async (r) => {
 };
 
 const batchDelete = async () => {
+  if (!canBatchDelete.value) return;
   try {
+    const statusCounter = {};
+    selectedReports.value.forEach((id) => {
+      const status = selectedReportStatusMap.value[id] || "UNKNOWN";
+      statusCounter[status] = (statusCounter[status] || 0) + 1;
+    });
+    const statusSummary = Object.entries(statusCounter)
+      .map(([status, count]) => `${getStatusText(status)} ${count} 条`)
+      .join("、");
     await ElMessageBox.confirm(
-      `确定要删除选中的 ${selectedReports.value.length} 条记录吗？`,
-      "提示",
+      `确定要删除选中的 ${selectedReports.value.length} 条报告吗？\n当前报告状态为：${statusSummary}\n删除会导致数据丢失，标注任务不能正常进行，是否确认删除？`,
+      "批量删除确认",
       { confirmButtonText: "确定", cancelButtonText: "取消", type: "warning" },
     );
     const idsToDelete = [...selectedReports.value];
-    for (const id of idsToDelete) {
-      await api.deleteReport(id);
-    }
+    const res = await api.batchDeleteReports(idsToDelete);
     selectedReports.value = [];
-    const nextTotal = Math.max(0, reportTotal.value - idsToDelete.length);
+    selectedReportStatusMap.value = {};
+    const nextTotal = Math.max(0, reportTotal.value - (res.deleted || idsToDelete.length));
     const maxPage = Math.max(1, Math.ceil(nextTotal / reportPageSize.value));
     reportTotal.value = nextTotal;
     if (reportPage.value > maxPage) {
@@ -712,6 +856,7 @@ const getStatusText = (status) => {
     REVIEW_ASSIGNED: "待复核",
     REVIEW_IN_PROGRESS: "复核中",
     DONE: "已完成",
+    UNKNOWN: "未知状态",
   };
   return statusMap[status] || status;
 };
@@ -741,6 +886,7 @@ const getRoleText = (role) => {
 watch(reportQuery, () => {
   reportPage.value = 1;
   selectedReports.value = [];
+  selectedReportStatusMap.value = {};
 });
 
 watch(

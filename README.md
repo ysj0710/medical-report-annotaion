@@ -15,3 +15,7 @@ medical-report-annotation/
 ## 下一步
 - 确认技术栈（前端框架、数据库、异步任务方案）。
 - 生成最小可跑的后端骨架 + 前端路由骨架。
+
+## 压测（k6）
+- 脚本位置：`scripts/k6/admin_read_load.js`
+- 使用说明：`scripts/k6/README.md`

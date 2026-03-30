@@ -71,13 +71,26 @@ class ImportTaskResponse(BaseModel):
 
 
 class AssignRequest(BaseModel):
+    mode: str  # selected / all
     report_ids: Optional[List[int]] = None
+    assign_all: Optional[bool] = None
+    q: Optional[str] = None
+    status: Optional[str] = None
     doctor_id: Optional[int] = None
     doctor_ids: Optional[List[int]] = None
-    mode: Optional[str] = "auto"  # auto / annotation / review
+    dispatch_mode: Optional[str] = "auto"  # auto / annotation / review
 
 
 class AssignResponse(BaseModel):
     assigned: int
     per_doctor: Optional[dict[str, int]] = None
     mode: Optional[str] = None
+
+
+class BatchDeleteRequest(BaseModel):
+    report_ids: List[int]
+
+
+class BatchDeleteResponse(BaseModel):
+    ok: bool
+    deleted: int
