@@ -19,3 +19,8 @@ medical-report-annotation/
 ## 压测（k6）
 - 脚本位置：`scripts/k6/admin_read_load.js`
 - 使用说明：`scripts/k6/README.md`
+
+## 管理员初始化
+- 服务启动时不再自动创建默认管理员账号。
+- 首次部署后，请进入 `backend/` 目录执行 `python scripts/init_admin.py`。
+- 脚本会交互式提示输入管理员用户名和密码。

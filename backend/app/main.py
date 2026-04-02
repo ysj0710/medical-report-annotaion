@@ -2,8 +2,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from .api.router import api_router
 from .core.database import engine, Base
-from .core.security import get_password_hash
-from .models.user import User
 from .models.report import Report
 from .models.annotation import Annotation
 from .models.import_task import ImportTask
@@ -84,24 +82,6 @@ async def lifespan(app: FastAPI):
             print("Added reviewed_at column to reports table")
     except Exception as e:
         print(f"Database migration warning: {e}")
-    finally:
-        db.close()
-
-    # 创建默认管理员账号
-    db = Session(engine)
-    try:
-        admin = db.query(User).filter(User.username == "admin", User.is_cancel == False).first()
-        if not admin:
-            admin = User(
-                username="admin",
-                password_hash=get_password_hash("admin123"),
-                role="admin",
-                enabled=True,
-                is_cancel=False
-            )
-            db.add(admin)
-            db.commit()
-            print("Default admin user created: admin / admin123")
     finally:
         db.close()
 
