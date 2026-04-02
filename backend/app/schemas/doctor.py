@@ -64,11 +64,17 @@ class DoctorReportResponse(BaseModel):
         from_attributes = True
 
 
+class DoctorProgressResponse(BaseModel):
+    done: int = 0
+    total: int = 0
+
+
 class DoctorReportListResponse(BaseModel):
     items: List[DoctorReportResponse]
     page: int
     page_size: int
     total: int
+    progress: DoctorProgressResponse
 
 
 class DraftRequest(BaseModel):

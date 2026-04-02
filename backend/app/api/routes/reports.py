@@ -393,19 +393,28 @@ def import_reports(
         # 标准化列名
         records = normalize_columns(df)
 
-        # 原始报告与预标注文件的 RIS_NO 必须一致，避免错配导入
+        # 允许部分原始报告没有预标注；仅拦截明显传错预标注文件的场景
         if pre_annotations_map:
             report_ris_set = {normalize_identifier(item.get("ris_no")) for item in records if item.get("ris_no")}
             pre_ris_set = {normalize_identifier(item) for item in pre_annotations_map.keys() if item}
             missing_in_pre = sorted([ris for ris in report_ris_set - pre_ris_set if ris])
             extra_in_pre = sorted([ris for ris in pre_ris_set - report_ris_set if ris])
-            if missing_in_pre or extra_in_pre:
-                hints = []
-                if missing_in_pre:
-                    hints.append(f"原始报告存在但预标注缺失: {', '.join(missing_in_pre[:10])}")
-                if extra_in_pre:
-                    hints.append(f"预标注存在但原始报告缺失: {', '.join(extra_in_pre[:10])}")
-                raise ValueError(f"上传的原始报告与预标注报告 RIS_NO 不匹配。{'；'.join(hints)}")
+            if extra_in_pre:
+                preview = ", ".join(extra_in_pre[:10])
+                suffix = " 等" if len(extra_in_pre) > 10 else ""
+                raise ValueError(
+                    f"上传的预标注文件中有 {len(extra_in_pre)} 个 RIS_NO 在原始报告中不存在，请核对文件。"
+                    f"示例: {preview}{suffix}"
+                )
+
+            if missing_in_pre:
+                preview = ", ".join(missing_in_pre[:10])
+                suffix = " 等" if len(missing_in_pre) > 10 else ""
+                task.warnings_count = len(missing_in_pre)
+                task.message = (
+                    f"{len(missing_in_pre)} 条原始报告没有对应预标注，已按无预标注导入。"
+                    f"示例: {preview}{suffix}"
+                )
 
         task.total_rows = len(records)
         success_count = 0

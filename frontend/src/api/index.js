@@ -9,6 +9,12 @@ function normalizeToken(raw) {
 
 let token = normalizeToken(localStorage.getItem('token'))
 let currentUser = null
+let currentUserRequest = null
+
+function setCurrentUser(user) {
+  currentUser = user || null
+  return currentUser
+}
 
 export const api = {
   setToken(t) {
@@ -23,6 +29,7 @@ export const api = {
     token = null
     localStorage.removeItem('token')
     currentUser = null
+    currentUserRequest = null
   },
   getToken() {
     return token
@@ -86,15 +93,8 @@ export const api = {
   login(username, password) {
     return this.post('/auth/login', { username, password }).then(data => {
       this.setToken(data.access_token)
-      return this.get('/auth/me')
-        .then(user => {
-          currentUser = user
-          return user
-        })
-        .catch(err => {
-          this.clearToken()
-          throw err
-        })
+      currentUserRequest = null
+      return setCurrentUser(data.user)
     })
   },
   getMe() {
@@ -102,9 +102,20 @@ export const api = {
       this.clearToken()
       return Promise.reject(new Error('Unauthorized'))
     }
-    return this.get('/auth/me').then(user => {
-      currentUser = user
-      return user
+    if (currentUser) {
+      return Promise.resolve(currentUser)
+    }
+    if (currentUserRequest) {
+      return currentUserRequest
+    }
+    currentUserRequest = this.get('/auth/me')
+      .then(user => setCurrentUser(user))
+      .catch(err => {
+        currentUserRequest = null
+        throw err
+      })
+    return currentUserRequest.finally(() => {
+      currentUserRequest = null
     })
   },
   logout() {

@@ -3,9 +3,9 @@
     <aside class="left-panel">
       <div class="filter-row">
         <el-radio-group v-model="activeFilter" size="small" @change="loadReports">
-          <el-radio-button label="all">全部</el-radio-button>
-          <el-radio-button label="unannotated">未标注</el-radio-button>
-          <el-radio-button label="annotated">已标注</el-radio-button>
+          <el-radio-button value="all">全部</el-radio-button>
+          <el-radio-button value="unannotated">未标注</el-radio-button>
+          <el-radio-button value="annotated">已标注</el-radio-button>
         </el-radio-group>
       </div>
 
@@ -42,7 +42,7 @@
                 <el-checkbox
                   v-for="col in doctorTableColumns"
                   :key="col.key"
-                  :label="col.key"
+                  :value="col.key"
                   :disabled="visibleColumnKeys.length === 1 && visibleColumnKeys.includes(col.key)"
                 >
                   {{ col.label }}
@@ -214,8 +214,10 @@
                 type="textarea"
                 :rows="2"
                 placeholder="建议说明"
+                :class="{ 'suggestion-textarea-error': !!card._suggestionValidationError }"
                 @input="handleSuggestionInput(card)"
               />
+              <div v-if="card._suggestionValidationError" class="card-inline-error card-inline-error-relaxed">{{ card._suggestionValidationError }}</div>
             </div>
 
             <div v-else>
@@ -231,13 +233,13 @@
               <el-button v-if="card.state === 'pending'" size="small" @click.stop="editCard(card)" :disabled="isEditingLocked">修改</el-button>
               <el-button v-if="card.state === 'saved'" size="small" @click.stop="editCard(card)" :disabled="isEditingLocked">修改</el-button>
               <el-button v-if="card.state === 'editing'" size="small" type="primary" @click.stop="saveCard(card)" :disabled="isEditingLocked">保存</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" @click.stop="cancelEdit(card)">取消</el-button>
+              <el-button v-if="showCancelEditButton(card)" size="small" @click.stop="cancelEdit(card)">取消</el-button>
             </template>
 
             <template v-else>
               <el-button v-if="card.state !== 'editing'" size="small" @click.stop="editCard(card)" :disabled="isEditingLocked">修改</el-button>
               <el-button v-if="card.state === 'editing'" size="small" type="primary" @click.stop="saveCard(card)" :disabled="isEditingLocked">保存</el-button>
-              <el-button v-if="card.state === 'editing'" size="small" @click.stop="cancelEdit(card)">取消</el-button>
+              <el-button v-if="showCancelEditButton(card)" size="small" @click.stop="cancelEdit(card)">取消</el-button>
             </template>
             <el-button
               size="small"
@@ -290,6 +292,7 @@ const autoSavePending = ref(false)
 const progress = ref({ done: 0, total: 0 })
 const dismissedPreCardKeysByReport = new Map()
 let highlightFocusTimer = null
+let cardFocusTimer = null
 
 const doctorTableColumns = [
   { key: 'ris_no', label: '检查号(RIS_NO)', prop: 'ris_no', width: 150 },
@@ -672,12 +675,13 @@ const buildSuggestionByMethod = (card, method, options = {}) => {
 const buildSuggestionByMethodWithReplacementAppend = (card, method, options = {}) => {
   const normalizedMethod = normalizeProcessMethod(method)
   const replacementText = normalizeInputText(options.replacementText ?? card.target)
-  if (normalizedMethod === PROCESS_METHOD.replace) {
-    return buildSuggestionByMethod(card, normalizedMethod, { replacementText })
-  }
   const baseSuggestion = buildSuggestionByMethod(card, normalizedMethod, { replacementText: '' })
   if (!replacementText) return baseSuggestion
   const replacementSuggestion = buildReplaceSuggestionByErrorType(card, replacementText)
+  const isReplaceEmptyPlaceholder =
+    normalizedMethod === PROCESS_METHOD.replace &&
+    normalizeInputText(baseSuggestion) === normalizeInputText(buildReplaceEmptyStateSuggestion())
+  if (isReplaceEmptyPlaceholder) return replacementSuggestion
   return appendSuggestionSentence(baseSuggestion, replacementSuggestion)
 }
 
@@ -744,7 +748,15 @@ const buildSuggestionByMethodWithCachedBase = (card, method, options = {}) => {
     return buildSuggestionByMethodWithReplacementAppend(card, normalizedMethod, { replacementText: '' })
   }
   if (normalizedMethod === PROCESS_METHOD.replace) {
-    return buildReplaceSuggestionByErrorType(card, replacementText)
+    const replaceSuggestion = buildReplaceSuggestionByErrorType(card, replacementText)
+    const replaceDefaultBase = normalizeInputText(
+      buildSuggestionByMethod(card, PROCESS_METHOD.replace, { replacementText: '' })
+    )
+    const isReplaceDefaultPlaceholder =
+      replaceDefaultBase === normalizeInputText(buildReplaceEmptyStateSuggestion())
+    const baseForAppend = isReplaceDefaultPlaceholder ? preservedPromptBase : replaceDefaultBase
+    if (!baseForAppend) return replaceSuggestion
+    return appendSuggestionSentence(baseForAppend, replaceSuggestion)
   }
   if (cachedBase) {
     return appendSuggestionSentence(cachedBase, buildReplaceSuggestionByErrorType(card, replacementText))
@@ -800,6 +812,12 @@ const inferProcessMethodFromImportedData = (card) => {
 
 const isEditing = (card) => card.state === 'editing'
 
+const showCancelEditButton = (card) => {
+  if (!isEditing(card)) return false
+  const backup = card?._backup
+  return card?.kind === 'pre' || backup?.kind === 'pre' || backup?.state === 'saved'
+}
+
 const getSafeSelectorValue = (value) => {
   const text = String(value ?? '')
   if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
@@ -824,6 +842,16 @@ const clearHighlightFocus = () => {
   if (highlightFocusTimer) {
     clearTimeout(highlightFocusTimer)
     highlightFocusTimer = null
+  }
+}
+
+const clearCardFocus = () => {
+  document.querySelectorAll('.error-card.card-focus').forEach((el) => {
+    el.classList.remove('card-focus')
+  })
+  if (cardFocusTimer) {
+    clearTimeout(cardFocusTimer)
+    cardFocusTimer = null
   }
 }
 
@@ -854,6 +882,67 @@ const focusCardHighlight = async (card, options = {}) => {
     target.classList.remove('hl-focus')
     highlightFocusTimer = null
   }, 1500)
+}
+
+const focusCardInList = async (card, options = {}) => {
+  if (!card?.id) return
+  const { scrollToCardList = true } = options
+  selectedCardId.value = card.id
+  if (scrollToCardList) {
+    await scrollToCard(card.id)
+  }
+  await nextTick()
+  const container = cardsContainerRef.value
+  if (!container) return
+  const safeId = getSafeSelectorValue(card.id)
+  const cardEl = container.querySelector(`.error-card[data-card-id="${safeId}"]`)
+  if (!cardEl) return
+  clearCardFocus()
+  cardEl.classList.add('card-focus')
+  cardFocusTimer = window.setTimeout(() => {
+    cardEl.classList.remove('card-focus')
+    cardFocusTimer = null
+  }, 1800)
+}
+
+const findSubmitBlockingCard = () => {
+  const incompleteNewManualCard = cards.value.find((card) =>
+    card.kind === 'manual' &&
+    card.state === 'editing' &&
+    !card._backup
+  )
+  if (incompleteNewManualCard) {
+    return {
+      card: incompleteNewManualCard,
+      message: '当前新增的选中文本标注未完成，请先填写并保存，或删除该标注卡片后再完成标注。'
+    }
+  }
+
+  const editingCard = cards.value.find((card) => card.state === 'editing')
+  if (!editingCard) return null
+
+  return {
+    card: editingCard,
+    message: editingCard.kind === 'pre'
+      ? '当前有修改中的预标注卡片未完成，请先保存、取消或删除该标注卡片后再完成标注。'
+      : '当前有修改中的标注卡片未完成，请先保存、取消或删除该标注卡片后再完成标注。'
+  }
+}
+
+const ensureCardsReadyBeforeSubmit = async () => {
+  const blocking = findSubmitBlockingCard()
+  if (!blocking) return true
+
+  await focusCardInList(blocking.card, { scrollToCardList: true })
+
+  ElMessage.warning({
+    message: blocking.message,
+    duration: 3500,
+    grouping: true
+  })
+
+  await focusCardInList(blocking.card, { scrollToCardList: true })
+  return false
 }
 
 const handleCardClick = async (card, event) => {
@@ -936,6 +1025,7 @@ const resetCardByErrorType = (card) => {
   card.manual_override = false
   card._methodSuggestionCache = {}
   card.target = ''
+  card._suggestionValidationError = ''
   card.process_method = getDefaultProcessMethodByErrorType(card.error_type)
   card.alert_message = buildSuggestionByMethod(card, card.process_method, { replacementText: '' })
   setCachedSuggestionByMethod(card, card.process_method, card.alert_message)
@@ -976,6 +1066,9 @@ const handleReplacementBlur = (card) => {
   card.alert_message = buildSuggestionByMethodWithCachedBase(card, card.process_method, {
     replacementText: replacement
   })
+  if (normalizeInputText(card.alert_message)) {
+    card._suggestionValidationError = ''
+  }
   enforceSuggestionLengthLimit(card)
   syncActionToAlertType(card)
 }
@@ -983,6 +1076,7 @@ const handleReplacementBlur = (card) => {
 const handleSuggestionInput = (card) => {
   const prevMethod = normalizeProcessMethod(card.process_method)
   card.alert_message = String(card.alert_message || '')
+  card._suggestionValidationError = ''
   enforceSuggestionLengthLimit(card)
   setCachedSuggestionByMethod(card, prevMethod, card.alert_message)
   applyRuleBBySuggestion(card)
@@ -1204,23 +1298,6 @@ const buildPayload = () => {
   }
 }
 
-const loadProgress = async () => {
-  const baseParams = {
-    page: 1,
-    page_size: 1,
-    only_mine: props.isAdminMode ? false : onlyMine.value,
-    lite: true
-  }
-  if (reportQuery.value) baseParams.q = reportQuery.value
-
-  const [all, annotated] = await Promise.all([
-    api.getDoctorReports({ ...baseParams, tab: 'all' }),
-    api.getDoctorReports({ ...baseParams, tab: 'annotated' })
-  ])
-
-  progress.value = { done: annotated.total || 0, total: all.total || 0 }
-}
-
 const loadReports = async () => {
   const params = {
     tab: activeFilter.value,
@@ -1234,8 +1311,7 @@ const loadReports = async () => {
   const res = await api.getDoctorReports(params)
   reportList.value = res.items
   reportTotal.value = res.total || 0
-
-  await loadProgress()
+  progress.value = res.progress || { done: 0, total: 0 }
 
   if (!currentReport.value && reportList.value.length > 0) {
     const preferred = props.initialReportId
@@ -1448,7 +1524,6 @@ const autoSaveAfterInteraction = async () => {
     if (currentReport.value.status === 'ASSIGNED') {
       updateCurrentReportStatusLocally('IN_PROGRESS')
     }
-    await loadProgress()
   } catch (e) {
     ElMessage.error(e.message || '自动暂存失败')
   } finally {
@@ -1467,6 +1542,7 @@ const editCard = (card) => {
     card.alert_message = buildSuggestionByMethodWithReplacementAppend(card, card.process_method, { replacementText: card.target })
   }
   card._targetValidationError = ''
+  card._suggestionValidationError = ''
   setCachedSuggestionByMethod(card, card.process_method, card.alert_message)
   applyProcessMethodInputState(card)
   card._backup = { ...card }
@@ -1475,13 +1551,14 @@ const editCard = (card) => {
 }
 
 const prepareCardForSave = async (card, options = {}) => {
-  const { showValidationDialog = true, allowAutoSuggestionWhenEmpty = false } = options
+  const { allowAutoSuggestionWhenEmpty = false } = options
 
   card.target = normalizeInputText(card.target)
   card.alert_message = normalizeInputText(card.alert_message)
   card.process_method = normalizeProcessMethod(card.process_method)
   card.manual_override = !!card.manual_override
   card._targetValidationError = ''
+  card._suggestionValidationError = ''
   enforceSuggestionLengthLimit(card)
   applyDefaultSeverity(card)
 
@@ -1499,9 +1576,7 @@ const prepareCardForSave = async (card, options = {}) => {
     if (allowAutoSuggestionWhenEmpty) {
       card.alert_message = buildSuggestionByMethodWithReplacementAppend(card, card.process_method, { replacementText: card.target })
     } else {
-      if (showValidationDialog) {
-        ElMessage.warning('请填写建议说明')
-      }
+      card._suggestionValidationError = '请填写建议说明'
       return false
     }
   }
@@ -1557,7 +1632,6 @@ const deleteCard = async (card) => {
 
 const confirmPreCard = async (card) => {
   const canSave = await prepareCardForSave(card, {
-    showValidationDialog: false,
     allowAutoSuggestionWhenEmpty: true
   })
   if (!canSave) return
@@ -1694,6 +1768,8 @@ const switchReportByOffset = async (offset) => {
   const fallbackTargetId = reportList.value[targetIdx]?.id
 
   if (intent === 'submit' && currentReport.value && canSubmitStatus(currentReport.value.status)) {
+    const cardsReady = await ensureCardsReadyBeforeSubmit()
+    if (!cardsReady) return
     const canSubmit = await ensurePreCardsReadyBeforeSubmit()
     if (!canSubmit) return
     try {
@@ -1755,7 +1831,6 @@ const autoConfirmPendingPreCards = async () => {
 
   for (const card of pendingCards) {
     await prepareCardForSave(card, {
-      showValidationDialog: false,
       allowAutoSuggestionWhenEmpty: true
     })
     card.kind = 'manual'
@@ -1790,6 +1865,8 @@ const ensurePreCardsReadyBeforeSubmit = async () => {
 
 const submitReport = async () => {
   if (!currentReport.value || !canSubmitCurrentReport.value) return
+  const cardsReady = await ensureCardsReadyBeforeSubmit()
+  if (!cardsReady) return
   const canSubmit = await ensurePreCardsReadyBeforeSubmit()
   if (!canSubmit) return
 
@@ -1890,6 +1967,7 @@ const handleOnlyMineChange = async (value) => {
 
 onBeforeUnmount(() => {
   clearHighlightFocus()
+  clearCardFocus()
 })
 
 onMounted(async () => {
@@ -1903,7 +1981,7 @@ onMounted(async () => {
     }
     restoreDismissedPreCardKeys()
 
-    currentUser.value = await api.getMe()
+    currentUser.value = api.getCurrentUser() || await api.getMe()
     if (props.isAdminMode) {
       onlyMine.value = false
     }
@@ -2144,6 +2222,12 @@ onMounted(async () => {
   100% { transform: scale(1); }
 }
 
+@keyframes card-focus-pulse {
+  0% { box-shadow: inset 0 0 0 1px rgba(220, 38, 38, 0.2), 0 0 0 0 rgba(220, 38, 38, 0.08); }
+  50% { box-shadow: inset 0 0 0 3px rgba(220, 38, 38, 0.72), 0 0 0 2px rgba(220, 38, 38, 0.14); }
+  100% { box-shadow: inset 0 0 0 1px rgba(220, 38, 38, 0.2), 0 0 0 0 rgba(220, 38, 38, 0.08); }
+}
+
 .right-panel {
   display: flex;
   flex-direction: column;
@@ -2163,12 +2247,19 @@ onMounted(async () => {
 .error-card {
   margin-bottom: 10px;
   border: 1px solid #e5e7eb;
+  position: relative;
   cursor: pointer;
 }
 
 .error-card.selected {
   border-color: #3b82f6;
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
+}
+
+.error-card.card-focus {
+  border-color: #dc2626;
+  box-shadow: inset 0 0 0 2px rgba(220, 38, 38, 0.58);
+  animation: card-focus-pulse 0.9s ease-in-out 2;
 }
 
 .card-head {
@@ -2254,6 +2345,10 @@ onMounted(async () => {
   box-shadow: 0 0 0 1px #ef4444 inset;
 }
 
+.suggestion-textarea-error :deep(.el-textarea__inner) {
+  box-shadow: 0 0 0 1px #ef4444 inset;
+}
+
 .card-inline-error {
   margin-top: -4px;
   margin-bottom: 8px;
@@ -2262,14 +2357,14 @@ onMounted(async () => {
   color: #ef4444;
 }
 
+.card-inline-error-relaxed {
+  margin-top: 4px;
+}
+
 .card-actions {
   margin-top: 8px;
   display: flex;
   gap: 8px;
-}
-
-.revoke-btn {
-  margin-left: auto;
 }
 
 </style>

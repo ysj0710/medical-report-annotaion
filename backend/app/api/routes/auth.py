@@ -31,7 +31,15 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             detail="用户已被禁用，请联系管理员"
         )
     access_token = create_access_token(data={"sub": user.username, "role": user.role})
-    return TokenResponse(access_token=access_token, role=user.role)
+    user_response = UserResponse(
+        id=user.id,
+        username=user.username,
+        role=user.role,
+        enabled=user.enabled,
+        can_view_all=user.can_view_all,
+        view_all_requested=user.view_all_requested
+    )
+    return TokenResponse(access_token=access_token, role=user.role, user=user_response)
 
 
 @router.get("/me", response_model=UserResponse)

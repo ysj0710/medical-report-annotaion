@@ -177,7 +177,22 @@
             <el-descriptions-item label="失败">{{
               importTask.failed_rows
             }}</el-descriptions-item>
+            <el-descriptions-item label="警告">{{
+              importTask.warnings_count
+            }}</el-descriptions-item>
           </el-descriptions>
+          <el-alert
+            v-if="
+              importTask.status === 'SUCCESS' &&
+              importTask.warnings_count > 0 &&
+              importTask.message
+            "
+            :title="importTask.message"
+            type="warning"
+            :closable="false"
+            show-icon
+            style="margin-top: 12px"
+          />
           <el-link
             v-if="importTask.error_report_path"
             type="danger"
@@ -257,14 +272,14 @@
     <el-dialog v-model="showAssignModal" title="分发报告给医生" width="760px">
       <div style="margin-bottom: 12px">
         <el-radio-group v-model="assignDispatchMode">
-          <el-radio label="annotation">首次分配（标注）</el-radio>
-          <el-radio label="review">复核分配</el-radio>
+          <el-radio value="annotation">首次分配（标注）</el-radio>
+          <el-radio value="review">复核分配</el-radio>
         </el-radio-group>
       </div>
       <div style="margin-bottom: 12px">
         <el-radio-group v-model="assignScope">
-          <el-radio label="selected">仅分配勾选报告（推荐）</el-radio>
-          <el-radio label="all">分配当前筛选全部报告</el-radio>
+          <el-radio value="selected">仅分配勾选报告（推荐）</el-radio>
+          <el-radio value="all">分配当前筛选全部报告</el-radio>
         </el-radio-group>
       </div>
       <div style="margin-bottom: 12px; color: #6b7280; font-size: 12px">
@@ -496,7 +511,13 @@ const handleImport = async () => {
     if (importTask.value.status !== "SUCCESS") {
       throw new Error(importTask.value.message || "导入失败");
     }
-    ElMessage.success("导入完成");
+    if (importTask.value.warnings_count > 0) {
+      ElMessage.success(
+        `导入完成，${importTask.value.warnings_count} 条报告按无预标注导入`,
+      );
+    } else {
+      ElMessage.success("导入完成");
+    }
   } catch (e) {
     ElMessage.error(e.message);
   } finally {

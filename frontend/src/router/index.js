@@ -1,8 +1,9 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import Login from '../pages/Login.vue'
-import AdminHome from '../pages/AdminHome.vue'
-import DoctorHome from '../pages/DoctorHome.vue'
-import ReviewerHome from '../pages/ReviewerHome.vue'
+
+const Login = () => import('../pages/Login.vue')
+const AdminHome = () => import('../pages/AdminHome.vue')
+const DoctorHome = () => import('../pages/DoctorHome.vue')
+const ReviewerHome = () => import('../pages/ReviewerHome.vue')
 
 const routes = [
   { path: '/', redirect: '/login' },

@@ -1,14 +1,14 @@
 from typing import Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import case
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session, load_only
 from ...core.database import get_db
 from ...models.user import User
 from ...models.report import Report
 from ...models.annotation import Annotation
 from ...schemas.doctor import (
-    DoctorReportResponse, DoctorReportListResponse,
+    DoctorReportResponse, DoctorReportListResponse, DoctorProgressResponse,
     DraftRequest, SubmitRequest, SaveDraftResponse, SubmitResponse
 )
 from ..deps import get_current_user, require_role
@@ -37,6 +37,8 @@ def list_doctor_reports(
     current_user: User = Depends(require_role(["doctor", "admin"]))
 ):
     """医生端报告列表"""
+    annotated_statuses = [STATUS_SUBMITTED, STATUS_DONE]
+
     # 根据 can_view_all 权限决定过滤条件
     if current_user.role == "admin":
         query = db.query(Report).filter(Report.is_cancel == False)
@@ -73,7 +75,21 @@ def list_doctor_reports(
             Report.submitted_at,
         ))
 
-    annotated_statuses = [STATUS_SUBMITTED, STATUS_DONE]
+    if q:
+        query = query.filter(
+            (Report.ris_no.ilike(f"%{q}%")) |
+            (Report.external_id.ilike(f"%{q}%")) |
+            (Report.report_text.ilike(f"%{q}%"))
+        )
+
+    base_query = query
+    progress_total, progress_done = base_query.with_entities(
+        func.count(Report.id),
+        func.coalesce(
+            func.sum(case((Report.status.in_(annotated_statuses), 1), else_=0)),
+            0
+        )
+    ).one()
 
     # 按 tab 筛选状态
     if tab == "unannotated":
@@ -85,13 +101,6 @@ def list_doctor_reports(
             Report.status.in_(annotated_statuses),
             Annotation.data.contains({"no_error": True})
         ).distinct(Report.id)
-
-    if q:
-        query = query.filter(
-            (Report.ris_no.ilike(f"%{q}%")) |
-            (Report.external_id.ilike(f"%{q}%")) |
-            (Report.report_text.ilike(f"%{q}%"))
-        )
 
     if tab == "all":
         query = query.order_by(
@@ -144,7 +153,8 @@ def list_doctor_reports(
         items=paged_items,
         page=page,
         page_size=page_size,
-        total=total
+        total=total,
+        progress=DoctorProgressResponse(done=progress_done or 0, total=progress_total or 0)
     )
 
 

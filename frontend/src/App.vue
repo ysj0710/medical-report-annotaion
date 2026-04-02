@@ -52,7 +52,7 @@ export default {
         return
       }
       try {
-        this.currentUser = await api.getMe()
+        this.currentUser = api.getCurrentUser() || await api.getMe()
         this.isLoggedIn = true
         // 如果在登录页且已登录，根据角色跳转
         if (this.$route.path === '/login') {
