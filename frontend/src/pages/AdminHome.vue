@@ -72,7 +72,7 @@
           prop="exam_item"
           show-overflow-tooltip
         />
-        <el-table-column label="标注员" prop="doctor_username" min-width="180" show-overflow-tooltip />
+        <el-table-column label="标注员" prop="doctor_username" width="150" show-overflow-tooltip />
         <el-table-column label="复核员" prop="reviewer_username" width="100" />
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
