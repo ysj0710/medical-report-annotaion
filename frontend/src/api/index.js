@@ -1,4 +1,24 @@
 const API_BASE = '/api'
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1'])
+
+function buildWebSocketOriginFromTarget(target) {
+  const raw = String(target || '').trim()
+  if (!raw) return ''
+  try {
+    const resolved = new URL(raw, window.location.origin)
+    if (resolved.protocol === 'http:') resolved.protocol = 'ws:'
+    if (resolved.protocol === 'https:') resolved.protocol = 'wss:'
+    return `${resolved.protocol}//${resolved.host}`
+  } catch (_e) {
+    return ''
+  }
+}
+
+function pushUniqueUrl(list, url) {
+  const value = String(url || '').trim()
+  if (!value || list.includes(value)) return
+  list.push(value)
+}
 
 function normalizeToken(raw) {
   if (!raw) return null
@@ -36,6 +56,46 @@ export const api = {
   },
   getCurrentUser() {
     return currentUser
+  },
+  buildCollaborationWebSocketUrls(reportId) {
+    const authToken = normalizeToken(token)
+    if (!authToken || !reportId || typeof window === 'undefined') return []
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const encodedToken = encodeURIComponent(authToken)
+    const path = `${API_BASE}/doctor/reports/${reportId}/collaboration/ws?token=${encodedToken}`
+    const urls = []
+    const hostname = window.location.hostname
+    const port = window.location.port
+    const isBareLocalhost = LOCAL_HOSTS.has(hostname) && (!port || port === '80' || port === '443')
+
+    if (!isBareLocalhost) {
+      pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
+    }
+
+    const envTarget = buildWebSocketOriginFromTarget(
+      import.meta.env.VITE_COLLABORATION_WS_TARGET ||
+      import.meta.env.VITE_API_PROXY_TARGET
+    )
+    if (envTarget) {
+      pushUniqueUrl(urls, `${envTarget}${path}`)
+    }
+
+    if (LOCAL_HOSTS.has(hostname)) {
+      pushUniqueUrl(urls, `${protocol}//127.0.0.1:8088${path}`)
+      pushUniqueUrl(urls, `${protocol}//localhost:8088${path}`)
+    } else if (!window.location.port || window.location.port === '80' || window.location.port === '443') {
+      pushUniqueUrl(urls, `${protocol}//${hostname}:8088${path}`)
+    }
+
+    if (isBareLocalhost) {
+      pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
+    }
+
+    return urls
+  },
+  buildCollaborationWebSocketUrl(reportId) {
+    return this.buildCollaborationWebSocketUrls(reportId)[0] || ''
   },
 
   async request(method, path, data = null) {
@@ -235,5 +295,8 @@ export const api = {
   },
   cancelAnnotation(reportId) {
     return this.post(`/doctor/reports/${reportId}/annotation/cancel`, {})
+  },
+  collaborationHeartbeat(reportId, intent = 'view', activity = null) {
+    return this.post(`/doctor/reports/${reportId}/collaboration/heartbeat`, { intent, activity })
   }
 }

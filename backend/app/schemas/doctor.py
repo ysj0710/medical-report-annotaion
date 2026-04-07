@@ -29,6 +29,7 @@ class AnnotationResponse(BaseModel):
     status: str
     draft_saved_at: Optional[datetime]
     submitted_at: Optional[datetime]
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -57,6 +58,8 @@ class DoctorReportResponse(BaseModel):
     review_assigned_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = None
     submitted_at: Optional[datetime]
+    annotation_status: Optional[str] = None
+    annotation_submitted_at: Optional[datetime] = None
     pre_annotations: Optional[List[Any]] = None  # 预标注错误列表
     annotation: Optional[AnnotationResponse] = None
 
@@ -94,3 +97,50 @@ class SubmitResponse(BaseModel):
     ok: bool
     submitted_at: datetime
     next_report_id: Optional[int] = None
+
+
+class CollaborationActivityPayload(BaseModel):
+    status: Optional[str] = None
+    label: Optional[str] = None
+    content_type: Optional[str] = None
+    selection_start: Optional[int] = None
+    selection_end: Optional[int] = None
+    selection_text: Optional[str] = None
+
+
+class CollaborationHeartbeatRequest(BaseModel):
+    intent: str = "view"  # view / edit / release
+    activity: Optional[CollaborationActivityPayload] = None
+
+
+class CollaborationParticipantResponse(BaseModel):
+    user_id: int
+    username: str
+    role: str
+    is_me: bool = False
+    is_editor: bool = False
+    last_seen_at: Optional[datetime] = None
+    last_activity_at: Optional[datetime] = None
+
+
+class CollaborationActivityResponse(BaseModel):
+    status: Optional[str] = None
+    label: Optional[str] = None
+    content_type: Optional[str] = None
+    selection_start: Optional[int] = None
+    selection_end: Optional[int] = None
+    selection_text: Optional[str] = None
+
+
+class CollaborationStateResponse(BaseModel):
+    report_id: int
+    participants: List[CollaborationParticipantResponse] = []
+    current_editor_user_id: Optional[int] = None
+    current_editor_username: Optional[str] = None
+    current_editor_role: Optional[str] = None
+    current_activity: Optional[CollaborationActivityResponse] = None
+    is_edit_locked: bool = False
+    can_edit: bool = True
+    granted: Optional[bool] = None
+    expires_at: Optional[datetime] = None
+    annotation_updated_at: Optional[datetime] = None

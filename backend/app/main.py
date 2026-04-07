@@ -5,6 +5,7 @@ from .core.database import engine, Base
 from .models.report import Report
 from .models.annotation import Annotation
 from .models.import_task import ImportTask
+from .models.collaboration import ReportCollaborationSession, ReportEditLock
 from sqlalchemy.orm import Session
 
 
@@ -80,6 +81,45 @@ async def lifespan(app: FastAPI):
                 conn.execute(text("ALTER TABLE reports ADD COLUMN reviewed_at TIMESTAMPTZ"))
                 conn.commit()
             print("Added reviewed_at column to reports table")
+
+        if inspector.has_table('report_collaboration_sessions'):
+            collaboration_columns = [col['name'] for col in inspector.get_columns('report_collaboration_sessions')]
+
+            if 'active_status' not in collaboration_columns:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE report_collaboration_sessions ADD COLUMN active_status VARCHAR(32)"))
+                    conn.commit()
+                print("Added active_status column to report_collaboration_sessions table")
+
+            if 'active_label' not in collaboration_columns:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE report_collaboration_sessions ADD COLUMN active_label VARCHAR(255)"))
+                    conn.commit()
+                print("Added active_label column to report_collaboration_sessions table")
+
+            if 'active_content_type' not in collaboration_columns:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE report_collaboration_sessions ADD COLUMN active_content_type VARCHAR(32)"))
+                    conn.commit()
+                print("Added active_content_type column to report_collaboration_sessions table")
+
+            if 'active_selection_start' not in collaboration_columns:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE report_collaboration_sessions ADD COLUMN active_selection_start INTEGER"))
+                    conn.commit()
+                print("Added active_selection_start column to report_collaboration_sessions table")
+
+            if 'active_selection_end' not in collaboration_columns:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE report_collaboration_sessions ADD COLUMN active_selection_end INTEGER"))
+                    conn.commit()
+                print("Added active_selection_end column to report_collaboration_sessions table")
+
+            if 'active_selection_text' not in collaboration_columns:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE report_collaboration_sessions ADD COLUMN active_selection_text TEXT"))
+                    conn.commit()
+                print("Added active_selection_text column to report_collaboration_sessions table")
     except Exception as e:
         print(f"Database migration warning: {e}")
     finally:

@@ -15,6 +15,7 @@ from ...models.user import User
 from ...models.report import Report
 from ...models.import_task import ImportTask
 from ...models.annotation import Annotation
+from ...models.collaboration import ReportCollaborationSession
 from ...schemas.report import (
     ReportResponse, ReportListResponse,
     ImportTaskResponse, AssignRequest, AssignResponse,
@@ -133,11 +134,11 @@ def normalize_alert_type_text(value: Optional[str]) -> str:
 
 def infer_error_level_by_error_type(error_type: Optional[str]) -> str:
     error_type_text = str(error_type or "").strip()
-    if error_type_text in {"sexs", "typos", "typoTerms"}:
+    if error_type_text in {"typos", "typo_modality", "typoTerms"}:
         return "low"
-    if error_type_text in {"bodyParts", "examitems", "typo_modality"}:
+    if error_type_text in {"examitems"}:
         return "medium"
-    if error_type_text in {"typo_unit", "organectomys", "positions"}:
+    if error_type_text in {"typo_unit", "positions", "organectomys", "sexs", "bodyParts"}:
         return "high"
     return "medium"
 
@@ -560,11 +561,59 @@ def list_reports(
     total = query.count()
     items = query.offset((page - 1) * page_size).limit(page_size).all()
 
+    report_ids = [item.id for item in items]
+    annotation_by_report_id = {}
+    admin_collaboration_users_by_report_id = {}
+    user_by_id = {}
+    if report_ids:
+        annotation_rows = db.query(Annotation).filter(Annotation.report_id.in_(report_ids)).all()
+        annotation_by_report_id = {annotation.report_id: annotation for annotation in annotation_rows}
+
+        related_user_ids = {
+            user_id for user_id in [
+                *(item.assigned_doctor_id for item in items),
+                *(item.reviewer_doctor_id for item in items)
+            ] if user_id
+        }
+        if related_user_ids:
+            user_rows = db.query(User).filter(
+                User.id.in_(related_user_ids),
+                User.is_cancel == False,
+                User.enabled == True
+            ).all()
+            user_by_id = {user.id: user for user in user_rows}
+
+        collaboration_rows = db.query(
+            ReportCollaborationSession.report_id,
+            User.id,
+            User.username
+        ).join(
+            User, User.id == ReportCollaborationSession.user_id
+        ).filter(
+            ReportCollaborationSession.report_id.in_(report_ids),
+            User.is_cancel == False,
+            User.enabled == True,
+            User.role == "admin"
+        ).order_by(
+            ReportCollaborationSession.report_id.asc(),
+            ReportCollaborationSession.last_activity_at.desc().nullslast(),
+            ReportCollaborationSession.last_seen_at.desc(),
+            User.id.asc()
+        ).all()
+
+        for report_id, user_id, username in collaboration_rows:
+            user_list = admin_collaboration_users_by_report_id.setdefault(report_id, [])
+            if any(existing["id"] == user_id for existing in user_list):
+                continue
+            user_list.append({"id": user_id, "username": username})
+
     # 添加医生信息到返回结果
     result_items = []
     for item in items:
-        annotation = db.query(Annotation).filter(Annotation.report_id == item.id).first()
+        annotation = annotation_by_report_id.get(item.id)
         annotator_id = item.annotator_doctor_id or (annotation.doctor_id if annotation else None)
+        admin_collaboration_users = admin_collaboration_users_by_report_id.get(item.id, [])
+        collaborator_names = [entry["username"] for entry in admin_collaboration_users if entry.get("username")]
         item_dict = {
             'id': item.id,
             'external_id': item.external_id,
@@ -598,13 +647,18 @@ def list_reports(
             'annotation_status': annotation.status if annotation else None,
             'annotation_submitted_at': annotation.submitted_at if annotation else None,
         }
-        if annotator_id:
-            doctor = db.query(User).filter(User.id == annotator_id, User.is_cancel == False).first()
-            if doctor:
-                item_dict['doctor_employee_id'] = doctor.employee_id
-                item_dict['doctor_username'] = doctor.username
+        assigned_doctor = user_by_id.get(item.assigned_doctor_id)
+        if assigned_doctor:
+            item_dict['doctor_employee_id'] = assigned_doctor.employee_id
+            item_dict['doctor_username'] = assigned_doctor.username
+            if assigned_doctor.username and assigned_doctor.username not in collaborator_names:
+                collaborator_names.append(assigned_doctor.username)
+        if collaborator_names:
+            item_dict['doctor_username'] = "、".join(collaborator_names)
+            if len(collaborator_names) > 1:
+                item_dict['doctor_employee_id'] = None
         if item.reviewer_doctor_id:
-            reviewer = db.query(User).filter(User.id == item.reviewer_doctor_id, User.is_cancel == False).first()
+            reviewer = user_by_id.get(item.reviewer_doctor_id)
             if reviewer:
                 item_dict['reviewer_employee_id'] = reviewer.employee_id
                 item_dict['reviewer_username'] = reviewer.username

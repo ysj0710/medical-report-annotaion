@@ -72,12 +72,12 @@
           prop="exam_item"
           show-overflow-tooltip
         />
-        <el-table-column label="标注员" prop="doctor_username" width="100" />
+        <el-table-column label="标注员" prop="doctor_username" min-width="180" show-overflow-tooltip />
         <el-table-column label="复核员" prop="reviewer_username" width="100" />
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
-            <el-tag :type="getStatusType(row.status)">{{
-              getStatusText(row.status)
+            <el-tag :type="getStatusType(row)">{{
+              getStatusText(row)
             }}</el-tag>
           </template>
         </el-table-column>
@@ -623,6 +623,17 @@ const handleAssign = async () => {
 };
 
 const viewReport = async (r) => {
+  if (r?.status === "IMPORTED") {
+    await ElMessageBox.alert(
+      "协同标注报告必须先把报告派发给用户，才能进入标注工作台。请先执行分发，再开始协同标注。",
+      "协同标注提示",
+      {
+        confirmButtonText: "知道了",
+        type: "warning",
+      },
+    );
+    return;
+  }
   currentWorkbenchReportId.value = r.id;
   showWorkbenchDialog.value = true;
 };
@@ -868,7 +879,18 @@ const formatTime = (_row, _column, cellValue) => {
   return `${year}-${month}-${day} ${hour}:${minute}:${second}`
 };
 
-const getStatusText = (status) => {
+const resolveStatusMeta = (input) => {
+  if (typeof input === "string") {
+    return { baseStatus: input, annotationStatus: "" };
+  }
+  return {
+    baseStatus: input?.status || "",
+    annotationStatus: input?.annotation_status || input?.annotation?.status || "",
+  };
+};
+
+const getStatusText = (input) => {
+  const { baseStatus } = resolveStatusMeta(input);
   const statusMap = {
     IMPORTED: "待分发",
     ASSIGNED: "已分发",
@@ -879,10 +901,11 @@ const getStatusText = (status) => {
     DONE: "已完成",
     UNKNOWN: "未知状态",
   };
-  return statusMap[status] || status;
+  return statusMap[baseStatus] || baseStatus;
 };
 
-const getStatusType = (status) => {
+const getStatusType = (input) => {
+  const { baseStatus } = resolveStatusMeta(input);
   const typeMap = {
     IMPORTED: "info", // 灰色 - 待分发
     ASSIGNED: "primary", // 蓝色 - 已分发
@@ -892,7 +915,7 @@ const getStatusType = (status) => {
     REVIEW_IN_PROGRESS: "warning", // 黄色 - 复核中
     DONE: "primary", // 蓝色 - 已完成
   };
-  return typeMap[status] || "";
+  return typeMap[baseStatus] || "";
 };
 
 const getRoleText = (role) => {

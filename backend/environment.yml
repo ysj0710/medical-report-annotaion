@@ -1,0 +1,18 @@
+name: medanno
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - fastapi
+      - uvicorn
+      - sqlalchemy
+      - psycopg2-binary
+      - pydantic-settings
+      - python-jose[cryptography]
+      - passlib[bcrypt]
+      - python-multipart
+      - openpyxl
+      - pandas
+      - reportlab
