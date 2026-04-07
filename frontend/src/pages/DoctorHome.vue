@@ -3482,6 +3482,7 @@ onMounted(async () => {
 .section-content :deep(.hl-chip.manual) {
   background: #dbeafe;
   color: #1e40af;
+  border: 1px solid #60a5fa;
 }
 
 .section-content :deep(.hl-chip.hl-collaboration-live) {
