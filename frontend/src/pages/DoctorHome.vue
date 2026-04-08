@@ -3889,6 +3889,7 @@ onMounted(async () => {
   gap: 4px;
   padding: 1px 6px 1px 4px;
   border-radius: 4px;
+  border: 2px solid transparent;
   cursor: pointer;
 }
 
@@ -3924,18 +3925,19 @@ onMounted(async () => {
 .section-content :deep(.hl-chip.pre) {
   background: #fef3c7;
   color: #92400e;
+  border-color: #f59e0b;
 }
 
 .section-content :deep(.hl-chip.manual) {
   background: #dbeafe;
   color: #1e40af;
-  border: 1px solid #60a5fa;
+  border-color: #60a5fa;
 }
 
 .section-content :deep(.hl-chip.hl-collaboration-live) {
   background: rgba(254, 226, 226, 0.9);
   color: #991b1b;
-  border: 1px dashed #ef4444;
+  border: 2px dashed #ef4444;
   box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.12);
 }
 
@@ -3944,19 +3946,20 @@ onMounted(async () => {
   text-decoration-thickness: 2px;
   background: #fee2e2;
   color: #991b1b;
+  border-color: #ef4444;
 }
 
 .section-content :deep(.hl-chip.hl-prompt) {
   background: #fee2e2;
   color: #b91c1c;
-  border: 1px solid #ef4444;
+  border-color: #ef4444;
   font-weight: 600;
 }
 
 .section-content :deep(.hl-chip.missing) {
   background: #fff7ed;
   color: #b45309;
-  border: 1px dashed #f59e0b;
+  border: 2px dashed #f59e0b;
 }
 
 .section-content :deep(.hl-chip.hl-focus) {
