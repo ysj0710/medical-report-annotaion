@@ -19,6 +19,27 @@ async def lifespan(app: FastAPI):
     try:
         from sqlalchemy import text, inspect
         inspector = inspect(engine)
+        dialect_name = engine.dialect.name
+
+        def create_index_if_missing(table_name: str, index_name: str, column_sql: str) -> None:
+            existing_indexes = {item["name"] for item in inspector.get_indexes(table_name)}
+            if index_name in existing_indexes:
+                return
+            with engine.connect() as conn:
+                conn.execute(text(f"CREATE INDEX {index_name} ON {table_name} ({column_sql})"))
+                conn.commit()
+            print(f"Added {index_name} index to {table_name} table")
+
+        def add_json_list_column(table_name: str, column_name: str) -> None:
+            with engine.connect() as conn:
+                if dialect_name == "postgresql":
+                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} JSONB DEFAULT '[]'::jsonb"))
+                    conn.execute(text(f"UPDATE {table_name} SET {column_name} = '[]'::jsonb WHERE {column_name} IS NULL"))
+                    conn.execute(text(f"ALTER TABLE {table_name} ALTER COLUMN {column_name} SET NOT NULL"))
+                else:
+                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} JSON DEFAULT '[]'"))
+                    conn.execute(text(f"UPDATE {table_name} SET {column_name} = '[]' WHERE {column_name} IS NULL"))
+                conn.commit()
 
         columns = [col['name'] for col in inspector.get_columns('users')]
         if 'employee_id' not in columns:
@@ -48,7 +69,10 @@ async def lifespan(app: FastAPI):
         report_columns = [col['name'] for col in inspector.get_columns('reports')]
         if 'pre_annotations' not in report_columns:
             with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE reports ADD COLUMN pre_annotations JSONB"))
+                if dialect_name == "postgresql":
+                    conn.execute(text("ALTER TABLE reports ADD COLUMN pre_annotations JSONB"))
+                else:
+                    conn.execute(text("ALTER TABLE reports ADD COLUMN pre_annotations JSON"))
                 conn.commit()
             print("Added pre_annotations column to reports table")
 
@@ -78,9 +102,31 @@ async def lifespan(app: FastAPI):
 
         if 'reviewed_at' not in report_columns:
             with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE reports ADD COLUMN reviewed_at TIMESTAMPTZ"))
+                conn.execute(text("ALTER TABLE reports ADD COLUMN reviewed_at TIMESTAMP"))
                 conn.commit()
             print("Added reviewed_at column to reports table")
+
+        if 'review_completed_user_ids' not in report_columns:
+            add_json_list_column('reports', 'review_completed_user_ids')
+            print("Added review_completed_user_ids column to reports table")
+
+        if 'review_completed_at' not in report_columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE reports ADD COLUMN review_completed_at TIMESTAMP"))
+                conn.commit()
+            print("Added review_completed_at column to reports table")
+
+        create_index_if_missing('reports', 'ix_reports_assigned_doctor_id', 'assigned_doctor_id')
+        create_index_if_missing('reports', 'ix_reports_reviewer_doctor_id', 'reviewer_doctor_id')
+        create_index_if_missing('reports', 'ix_reports_assigned_cancel_id', 'assigned_doctor_id, is_cancel, id')
+        create_index_if_missing('reports', 'ix_reports_status_cancel_id', 'status, is_cancel, id')
+
+        if inspector.has_table('annotations'):
+            annotation_columns = [col['name'] for col in inspector.get_columns('annotations')]
+
+            if 'annotation_user_ids' not in annotation_columns:
+                add_json_list_column('annotations', 'annotation_user_ids')
+                print("Added annotation_user_ids column to annotations table")
 
         if inspector.has_table('report_collaboration_sessions'):
             collaboration_columns = [col['name'] for col in inspector.get_columns('report_collaboration_sessions')]

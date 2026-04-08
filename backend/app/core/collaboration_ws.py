@@ -17,6 +17,14 @@ class CollaborationSocketClient:
     role: str
 
 
+@dataclass(eq=False)
+class ReportUpdatesSocketClient:
+    websocket: WebSocket
+    user_id: int
+    username: str
+    role: str
+
+
 class CollaborationSocketHub:
     def __init__(self) -> None:
         self._clients_by_report: Dict[int, Set[CollaborationSocketClient]] = defaultdict(set)
@@ -41,4 +49,24 @@ class CollaborationSocketHub:
             return list(self._clients_by_report.get(report_id, ()))
 
 
+class ReportUpdatesSocketHub:
+    def __init__(self) -> None:
+        self._clients: Set[ReportUpdatesSocketClient] = set()
+        self._lock = asyncio.Lock()
+
+    async def connect(self, client: ReportUpdatesSocketClient) -> None:
+        await client.websocket.accept()
+        async with self._lock:
+            self._clients.add(client)
+
+    async def disconnect(self, client: ReportUpdatesSocketClient) -> None:
+        async with self._lock:
+            self._clients.discard(client)
+
+    async def get_clients(self) -> List[ReportUpdatesSocketClient]:
+        async with self._lock:
+            return list(self._clients)
+
+
 collaboration_socket_hub = CollaborationSocketHub()
+report_updates_socket_hub = ReportUpdatesSocketHub()

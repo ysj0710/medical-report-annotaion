@@ -38,5 +38,7 @@ class Report(Base):
     reviewer_doctor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     review_assigned_at = Column(DateTime(timezone=True), nullable=True)
     reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    review_completed_user_ids = Column(JSONB, nullable=False, default=list)
+    review_completed_at = Column(DateTime(timezone=True), nullable=True)
 
     submitted_at = Column(DateTime(timezone=True), nullable=True)

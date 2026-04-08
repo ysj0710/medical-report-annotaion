@@ -73,7 +73,7 @@
           show-overflow-tooltip
         />
         <el-table-column label="标注员" prop="doctor_username" width="150" show-overflow-tooltip />
-        <el-table-column label="复核员" prop="reviewer_username" width="100" />
+        <el-table-column label="复核员" prop="reviewer_username" width="150" show-overflow-tooltip />
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <el-tag :type="getStatusType(row)">{{
@@ -346,13 +346,15 @@
 </template>
 
 <script setup>
-import { ref, watch, nextTick, computed } from "vue";
+import { ref, watch, nextTick, computed, onMounted, onBeforeUnmount } from "vue";
 import { useRoute } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api } from "../api";
 import DoctorHome from "./DoctorHome.vue";
 
 const route = useRoute();
+const REPORT_UPDATES_WS_KEEPALIVE_MS = 15000;
+const REPORT_UPDATES_WS_RECONNECT_MS = 1500;
 
 // 状态
 const activeTab = ref("reports");
@@ -368,6 +370,13 @@ const reportTotal = ref(0);
 const selectedReports = ref([]);
 const selectedReportStatusMap = ref({});
 const isRestoringSelection = ref(false); // 标记是否正在恢复选中状态
+let reportsLoadRequestSeq = 0;
+let reportUpdatesSocket = null;
+let reportUpdatesSocketKeepAliveTimer = null;
+let reportUpdatesSocketReconnectTimer = null;
+let reportUpdatesSocketSessionId = 0;
+let reportUpdatesSocketUrlCandidates = [];
+let reportUpdatesSocketUrlIndex = 0;
 
 // 导入
 const importFile = ref(null);
@@ -459,11 +468,15 @@ const handleSelectionChange = (selection) => {
   selectedReportStatusMap.value = nextStatusMap;
 };
 
-const loadReports = async () => {
+const loadReports = async (options = {}) => {
+  const { silent = false } = options;
+  const requestSeq = ++reportsLoadRequestSeq;
   const params = { page: reportPage.value, page_size: reportPageSize.value };
   if (reportQuery.value) params.q = reportQuery.value;
   if (reportStatus.value) params.status = reportStatus.value;
   const res = await api.getReports(params);
+  if (requestSeq !== reportsLoadRequestSeq) return;
+
   reports.value = res.items;
   reportTotal.value = res.total;
 
@@ -484,6 +497,176 @@ const loadReports = async () => {
     // 恢复完成后重置标记
     isRestoringSelection.value = false;
   });
+};
+
+const clearReportUpdatesSocketKeepAliveTimer = () => {
+  if (reportUpdatesSocketKeepAliveTimer) {
+    clearTimeout(reportUpdatesSocketKeepAliveTimer);
+    reportUpdatesSocketKeepAliveTimer = null;
+  }
+};
+
+const clearReportUpdatesSocketReconnectTimer = () => {
+  if (reportUpdatesSocketReconnectTimer) {
+    clearTimeout(reportUpdatesSocketReconnectTimer);
+    reportUpdatesSocketReconnectTimer = null;
+  }
+};
+
+const scheduleReportUpdatesSocketKeepAlive = (sessionId) => {
+  clearReportUpdatesSocketKeepAliveTimer();
+  if (
+    typeof window === "undefined" ||
+    sessionId !== reportUpdatesSocketSessionId ||
+    !reportUpdatesSocket ||
+    reportUpdatesSocket.readyState !== WebSocket.OPEN
+  ) {
+    return;
+  }
+
+  reportUpdatesSocketKeepAliveTimer = window.setTimeout(() => {
+    if (
+      sessionId !== reportUpdatesSocketSessionId ||
+      !reportUpdatesSocket ||
+      reportUpdatesSocket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    try {
+      reportUpdatesSocket.send("ping");
+    } catch (_e) {
+      // ignore and let reconnect handle it
+    } finally {
+      scheduleReportUpdatesSocketKeepAlive(sessionId);
+    }
+  }, REPORT_UPDATES_WS_KEEPALIVE_MS);
+};
+
+const scheduleReportUpdatesSocketReconnect = (sessionId) => {
+  clearReportUpdatesSocketReconnectTimer();
+  if (typeof window === "undefined" || sessionId !== reportUpdatesSocketSessionId) return;
+
+  reportUpdatesSocketReconnectTimer = window.setTimeout(() => {
+    if (sessionId !== reportUpdatesSocketSessionId) return;
+    startReportUpdatesSocket({
+      urlCandidates: reportUpdatesSocketUrlCandidates,
+      candidateIndex: reportUpdatesSocketUrlIndex,
+    });
+  }, REPORT_UPDATES_WS_RECONNECT_MS);
+};
+
+const stopReportUpdatesSocket = (options = {}) => {
+  const { close = true } = options;
+  reportUpdatesSocketSessionId += 1;
+  clearReportUpdatesSocketKeepAliveTimer();
+  clearReportUpdatesSocketReconnectTimer();
+
+  const socket = reportUpdatesSocket;
+  reportUpdatesSocket = null;
+  reportUpdatesSocketUrlCandidates = [];
+  reportUpdatesSocketUrlIndex = 0;
+
+  if (close && socket) {
+    try {
+      socket.close(1000, "normal-close");
+    } catch (_e) {
+      // ignore
+    }
+  }
+};
+
+const handleReportUpdatesMessage = async (payload) => {
+  if (payload?.type !== "reports-updated") return;
+  if (activeTab.value !== "reports") return;
+  await loadReports({ silent: true });
+};
+
+const openReportUpdatesSocketCandidate = (sessionId, urlCandidates, candidateIndex) => {
+  const wsUrl = urlCandidates[candidateIndex];
+  if (!wsUrl || typeof WebSocket === "undefined") return false;
+
+  reportUpdatesSocketUrlCandidates = [...urlCandidates];
+  reportUpdatesSocketUrlIndex = candidateIndex;
+
+  const socket = new WebSocket(wsUrl);
+  reportUpdatesSocket = socket;
+  let opened = false;
+
+  socket.addEventListener("open", () => {
+    if (sessionId !== reportUpdatesSocketSessionId || reportUpdatesSocket !== socket) {
+      try {
+        socket.close(1000, "stale-connection");
+      } catch (_e) {
+        // ignore
+      }
+      return;
+    }
+    opened = true;
+    clearReportUpdatesSocketReconnectTimer();
+    scheduleReportUpdatesSocketKeepAlive(sessionId);
+    if (activeTab.value === "reports") {
+      void loadReports({ silent: true });
+    }
+  });
+
+  socket.addEventListener("message", (event) => {
+    if (sessionId !== reportUpdatesSocketSessionId || reportUpdatesSocket !== socket) return;
+    try {
+      const payload = JSON.parse(event.data || "{}");
+      void handleReportUpdatesMessage(payload);
+    } catch (_e) {
+      // ignore malformed payloads
+    }
+  });
+
+  socket.addEventListener("close", () => {
+    if (sessionId !== reportUpdatesSocketSessionId) return;
+    clearReportUpdatesSocketKeepAliveTimer();
+    if (reportUpdatesSocket === socket) {
+      reportUpdatesSocket = null;
+    }
+
+    if (!opened && candidateIndex + 1 < urlCandidates.length) {
+      openReportUpdatesSocketCandidate(sessionId, urlCandidates, candidateIndex + 1);
+      return;
+    }
+
+    scheduleReportUpdatesSocketReconnect(sessionId);
+  });
+
+  socket.addEventListener("error", () => {
+    clearReportUpdatesSocketKeepAliveTimer();
+  });
+
+  return true;
+};
+
+const startReportUpdatesSocket = (options = {}) => {
+  if (typeof WebSocket === "undefined") return false;
+  const {
+    urlCandidates = api.buildReportUpdatesWebSocketUrls(),
+    candidateIndex = 0,
+  } = options;
+  if (!Array.isArray(urlCandidates) || !urlCandidates.length) return false;
+
+  stopReportUpdatesSocket();
+
+  const sessionId = reportUpdatesSocketSessionId;
+  return openReportUpdatesSocketCandidate(
+    sessionId,
+    urlCandidates,
+    Math.max(0, Math.min(candidateIndex, urlCandidates.length - 1)),
+  );
+};
+
+const handleDocumentVisibilityChange = () => {
+  if (typeof document !== "undefined" && document.hidden) return;
+  if (activeTab.value === "reports") {
+    if (!reportUpdatesSocket || reportUpdatesSocket.readyState !== WebSocket.OPEN) {
+      startReportUpdatesSocket();
+    }
+    void loadReports({ silent: true });
+  }
 };
 
 const loadUsers = async () => {
@@ -925,6 +1108,20 @@ const getRoleText = (role) => {
   };
   return roleMap[role] || role;
 };
+
+onMounted(() => {
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", handleDocumentVisibilityChange);
+  }
+  startReportUpdatesSocket();
+});
+
+onBeforeUnmount(() => {
+  stopReportUpdatesSocket();
+  if (typeof document !== "undefined") {
+    document.removeEventListener("visibilitychange", handleDocumentVisibilityChange);
+  }
+});
 
 // 监听 query 变化
 watch(reportQuery, () => {

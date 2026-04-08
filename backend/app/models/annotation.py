@@ -10,6 +10,7 @@ class Annotation(Base):
     id = Column(Integer, primary_key=True, index=True)
     report_id = Column(Integer, ForeignKey("reports.id"), unique=True, nullable=False)
     doctor_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    annotation_user_ids = Column(JSONB, nullable=False, default=list)
     data = Column(JSONB, nullable=False, default={})
     status = Column(String(32), default="DRAFT")  # DRAFT/SUBMITTED
     draft_saved_at = Column(DateTime(timezone=True), nullable=True)

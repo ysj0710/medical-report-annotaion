@@ -6,6 +6,8 @@
           <el-radio-button value="all">全部</el-radio-button>
           <el-radio-button value="unannotated">未标注</el-radio-button>
           <el-radio-button value="annotated">已标注</el-radio-button>
+          <el-radio-button value="review">待复核</el-radio-button>
+          <el-radio-button value="reviewed">已复核</el-radio-button>
         </el-radio-group>
       </div>
 
@@ -85,7 +87,7 @@
       </div>
 
       <div class="progress-wrap">
-        <div class="progress-title">工作进度 {{ progress.done }}/{{ progress.total }}</div>
+        <div class="progress-title">{{ progressTitle }} {{ progress.done }}/{{ progress.total }}</div>
         <el-progress :percentage="progressPercent" :stroke-width="10" />
       </div>
     </aside>
@@ -172,7 +174,10 @@
             class="floating-highlight-tooltip"
             :style="highlightTooltipStyle"
           >
-            {{ highlightTooltip.text }}
+            <div v-if="highlightTooltip.title" class="floating-highlight-tooltip-title">
+              {{ highlightTooltip.title }}
+            </div>
+            <div class="floating-highlight-tooltip-body">{{ highlightTooltip.text }}</div>
           </div>
         </div>
       </div>
@@ -333,9 +338,13 @@ const props = defineProps({
   initialReportId: { type: Number, default: null }
 })
 
-const TASK_COLUMNS_STORAGE_KEY = 'doctor_task_visible_columns_v1'
-const DISMISSED_PRE_STORAGE_KEY = 'doctor_dismissed_pre_cards_v1'
+const TASK_COLUMNS_STORAGE_KEY_PREFIX = 'doctor_task_visible_columns_by_user_v2'
+const DISMISSED_PRE_STORAGE_KEY_PREFIX = 'doctor_dismissed_pre_cards_by_user_v2'
+const LEGACY_TASK_COLUMNS_STORAGE_KEY = 'doctor_task_visible_columns_v1'
+const LEGACY_DISMISSED_PRE_STORAGE_KEY = 'doctor_dismissed_pre_cards_v1'
 const DOCTOR_LIST_PAGE_SIZE = 1000
+const REPORT_UPDATES_WS_KEEPALIVE_MS = 15000
+const REPORT_UPDATES_WS_RECONNECT_MS = 1500
 const COLLABORATION_HIDDEN_POLL_MS = 12000
 const COLLABORATION_WS_KEEPALIVE_MS = 5000
 const COLLABORATION_WS_EDIT_KEEPALIVE_MS = 2500
@@ -343,6 +352,7 @@ const COLLABORATION_WS_RECONNECT_MS = 1500
 const COLLABORATION_WS_REQUEST_TIMEOUT_MS = 4000
 const COLLABORATION_ACTIVITY_WINDOW_MS = 8000
 const COLLABORATION_SELECTION_SYNC_DEBOUNCE_MS = 80
+const LOCAL_SELECTION_ACTIVITY_HOLD_MS = 260
 const COLLABORATION_ACTIVITY_LABEL_MAX_LENGTH = 80
 const COLLABORATION_SELECTION_TEXT_MAX_LENGTH = 96
 
@@ -379,9 +389,12 @@ const submitting = ref(false)
 const autoGoNextAfterSubmit = ref(true)
 const autoSaving = ref(false)
 const autoSavePending = ref(false)
-const progress = ref({ done: 0, total: 0 })
+const annotationProgress = ref({ done: 0, total: 0 })
+const reviewProgress = ref({ done: 0, total: 0 })
+const overallProgress = ref({ done: 0, total: 0 })
 const highlightTooltip = ref({
   visible: false,
+  title: '',
   text: '',
   left: 0,
   top: 0
@@ -401,6 +414,15 @@ const collaborationSocketPendingRequests = new Map()
 let lastLocalEditActivityAt = 0
 let activeTooltipAnchor = null
 let collaborationSelectionSyncTimer = null
+let reportListLoadRequestSeq = 0
+let reportUpdatesSocket = null
+let reportUpdatesSocketKeepAliveTimer = null
+let reportUpdatesSocketReconnectTimer = null
+let reportUpdatesSocketSessionId = 0
+let reportUpdatesSocketUrlCandidates = []
+let reportUpdatesSocketUrlIndex = 0
+let localSelectionActivityHoldUntil = 0
+let lastPublishedActivitySignature = ''
 
 const doctorTableColumns = [
   { key: 'ris_no', label: '检查号(RIS_NO)', prop: 'ris_no', width: 150 },
@@ -462,6 +484,21 @@ const reportHeaderTitle = computed(() => {
   return `${modality}检查报告单`
 })
 
+const progress = computed(() => (
+  activeFilter.value === 'all'
+    ? overallProgress.value
+    : ['review', 'reviewed'].includes(activeFilter.value)
+      ? reviewProgress.value
+      : annotationProgress.value
+))
+const progressTitle = computed(() => (
+  activeFilter.value === 'all'
+    ? '总体进度'
+    : ['review', 'reviewed'].includes(activeFilter.value)
+    ? '复核进度'
+    : '工作进度'
+))
+
 const progressPercent = computed(() => {
   if (!progress.value.total) return 0
   return Math.round((progress.value.done / progress.value.total) * 100)
@@ -477,6 +514,16 @@ const canSubmitStatus = (status) => ['ASSIGNED', 'IN_PROGRESS', 'REVIEW_ASSIGNED
 const isDraftWorkflowStatus = (status) => ['ASSIGNED', 'IN_PROGRESS', 'REVIEW_IN_PROGRESS'].includes(status || '')
 const resolveBaseStatus = (reportLike) => reportLike?.status || ''
 const getAnnotationStatus = (reportLike) => reportLike?.annotation_status || reportLike?.annotation?.status || ''
+const getReviewCompletedUserIds = (reportLike) => Array.isArray(reportLike?.review_completed_user_ids) ? reportLike.review_completed_user_ids : []
+const isReviewTask = (reportLike) => !!(
+  reportLike?.is_review_task ||
+  ['REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS'].includes(resolveBaseStatus(reportLike)) ||
+  reportLike?.reviewer_doctor_id ||
+  reportLike?.review_assigned_at ||
+  getReviewCompletedUserIds(reportLike).length
+)
+const isAssignedReviewer = (reportLike) => !!reportLike?.is_current_user_assigned_reviewer
+const hasCurrentUserCompletedReview = (reportLike) => !!reportLike?.has_current_user_completed_review
 const isAdminImportedReport = (reportLike) => props.isAdminMode && resolveBaseStatus(reportLike) === 'IMPORTED'
 const requiresDistributionBeforeAnnotation = computed(() => isAdminImportedReport(currentReport.value))
 const isViewOnlyAccessibleReport = computed(() => {
@@ -491,37 +538,132 @@ const getDisplayStatus = (reportLike) => {
 }
 
 const isAnnotatedDisplayStatus = (reportLike) => {
+  if (isReviewTask(reportLike)) return false
   const displayStatus = getDisplayStatus(reportLike)
   return displayStatus === 'SUBMITTED' || displayStatus === 'DONE'
 }
 
-const filterAdminReports = (items) => {
-  if (activeFilter.value === 'annotated') {
+const isUnannotatedDisplayStatus = (reportLike) => {
+  if (isReviewTask(reportLike)) return false
+  return ['IMPORTED', 'ASSIGNED', 'IN_PROGRESS'].includes(getDisplayStatus(reportLike))
+}
+
+const isPendingReviewDisplayStatus = (reportLike) => {
+  return ['REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS'].includes(getDisplayStatus(reportLike))
+}
+
+const isReviewedDisplayStatus = (reportLike) => {
+  if (!isReviewTask(reportLike)) return false
+  if (getDisplayStatus(reportLike) !== 'DONE') return false
+  if (props.isAdminMode) return true
+  if (onlyMine.value) return true
+  return hasCurrentUserCompletedReview(reportLike) || isAssignedReviewer(reportLike)
+}
+
+const getReportsForFilter = (items, filter) => {
+  if (filter === 'review') {
+    return items.filter((item) => isPendingReviewDisplayStatus(item))
+  }
+  if (filter === 'reviewed') {
+    return items.filter((item) => isReviewedDisplayStatus(item))
+  }
+  if (filter === 'annotated') {
     return items.filter((item) => isAnnotatedDisplayStatus(item))
   }
-  if (activeFilter.value === 'unannotated') {
-    return items.filter((item) => !isAnnotatedDisplayStatus(item))
+  if (filter === 'unannotated') {
+    return items.filter((item) => isUnannotatedDisplayStatus(item))
   }
   return items
 }
 
-const buildAdminProgress = (items) => {
-  const total = items.length
+const filterReportsByActiveFilter = (items) => getReportsForFilter(items, activeFilter.value)
+
+const resolveBestAvailableFilter = (items) => {
+  const candidates = ['unannotated', 'review', 'reviewed', 'annotated', 'all']
+  return candidates.find((filter) => getReportsForFilter(items, filter).length > 0) || 'all'
+}
+
+const buildAnnotationProgress = (items) => {
+  const annotationItems = items.filter((item) => !isReviewTask(item))
+  const total = annotationItems.length
   const done = items.filter((item) => (
     isAnnotatedDisplayStatus(item) ||
-    getAnnotationStatus(item) === 'SUBMITTED'
+    (!isReviewTask(item) && getAnnotationStatus(item) === 'SUBMITTED')
   )).length
   return { done, total }
+}
+
+const buildReviewProgress = (items) => {
+  const reviewItems = items.filter((item) => isReviewTask(item))
+  const done = reviewItems.filter((item) => (
+    getDisplayStatus(item) === 'DONE' || getReviewCompletedUserIds(item).length > 0
+  )).length
+  return { done, total: reviewItems.length }
+}
+
+const buildOverallProgress = (items) => {
+  const total = items.length
+  const done = items.filter((item) => {
+    if (isReviewTask(item)) {
+      return isReviewedDisplayStatus(item)
+    }
+    return isAnnotatedDisplayStatus(item) || getAnnotationStatus(item) === 'SUBMITTED'
+  }).length
+  return { done, total }
+}
+
+const syncCurrentReportSummaryFromRow = (row) => {
+  if (!currentReport.value || !row || currentReport.value.id !== row.id) return
+  currentReport.value.status = row.status
+  currentReport.value.annotation_status = row.annotation_status
+  currentReport.value.annotation_submitted_at = row.annotation_submitted_at
+  currentReport.value.assigned_doctor_id = row.assigned_doctor_id
+  currentReport.value.annotator_doctor_id = row.annotator_doctor_id
+  currentReport.value.reviewer_doctor_id = row.reviewer_doctor_id
+  currentReport.value.submitted_at = row.submitted_at
+  currentReport.value.review_completed_at = row.review_completed_at
+  currentReport.value.review_completed_user_ids = row.review_completed_user_ids
+  currentReport.value.review_completed_users = row.review_completed_users
+  currentReport.value.is_review_task = row.is_review_task
+  currentReport.value.is_current_user_assigned_reviewer = row.is_current_user_assigned_reviewer
+  currentReport.value.has_current_user_completed_review = row.has_current_user_completed_review
+}
+
+const syncReportCollectionsFromAllReports = () => {
+  reportList.value = filterReportsByActiveFilter(allReportList.value)
+  reportTotal.value = reportList.value.length
+  annotationProgress.value = buildAnnotationProgress(allReportList.value)
+  reviewProgress.value = buildReviewProgress(allReportList.value)
+  overallProgress.value = buildOverallProgress(allReportList.value)
+
+  const currentRow = currentReport.value
+    ? allReportList.value.find((item) => item.id === currentReport.value.id)
+    : null
+  if (currentRow) {
+    syncCurrentReportSummaryFromRow(currentRow)
+  }
 }
 
 const collaborationParticipants = computed(() => collaborationState.value?.participants || [])
 const currentEditorUserId = computed(() => collaborationState.value?.current_editor_user_id || null)
 const currentEditorUsername = computed(() => collaborationState.value?.current_editor_username || '')
 const currentEditorRole = computed(() => collaborationState.value?.current_editor_role || '')
+const currentCollaborationActivityUserId = computed(() => collaborationState.value?.current_activity_user_id || null)
+const currentCollaborationActivityUsername = computed(() => collaborationState.value?.current_activity_username || '')
+const currentCollaborationActivityRole = computed(() => collaborationState.value?.current_activity_role || '')
+const currentCollaborationActivityIsEditor = computed(() => !!collaborationState.value?.current_activity_is_editor)
 const currentCollaborationActivity = computed(() => collaborationState.value?.current_activity || null)
 const isCurrentUserEditor = computed(() => {
   const userId = currentUser.value?.id
   return !!userId && currentEditorUserId.value === userId
+})
+const hasRemoteCollaborationActivity = computed(() => {
+  const userId = currentUser.value?.id
+  return !!(
+    currentCollaborationActivity.value &&
+    currentCollaborationActivityUserId.value &&
+    currentCollaborationActivityUserId.value !== userId
+  )
 })
 const isCollaborationEditingLocked = computed(() => {
   if (!currentReport.value) return false
@@ -541,14 +683,21 @@ const canSubmitCurrentReport = computed(() => {
   return canSubmitStatus(currentDisplayStatus.value)
 })
 const showCancelAnnotationButton = computed(() => {
+  if (!currentReport.value) return false
   if (isViewOnlyAccessibleReport.value) return false
+  if (requiresDistributionBeforeAnnotation.value) return false
   const status = currentDisplayStatus.value
-  return status === 'SUBMITTED' || status === 'REVIEW_ASSIGNED'
+  const annotationStatus = getAnnotationStatus(currentReport.value)
+  if (annotationStatus === 'SUBMITTED') return true
+  if (isReviewTask(currentReport.value)) {
+    return ['REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS', 'DONE'].includes(status)
+  }
+  return ['SUBMITTED', 'DONE'].includes(status)
 })
 const submitButtonText = computed(() => {
-  const status = currentDisplayStatus.value
-  if (status === 'REVIEW_ASSIGNED') return '确认无误'
-  if (status === 'REVIEW_IN_PROGRESS') return '完成标注核验'
+  if (isReviewTask(currentReport.value)) {
+    return isAssignedReviewer(currentReport.value) ? '完成标注核验' : '确认无误'
+  }
   return '完成标注'
 })
 const currentReportIndex = computed(() => {
@@ -593,6 +742,10 @@ const collaborationStatusText = computed(() => {
     const roleText = currentEditorRole.value === 'admin' ? '管理员' : '专家'
     return `${roleText}${currentEditorUsername.value || '其他用户'} ${collaborationActivityText.value || '正在标注'}，你当前为只读查看`
   }
+  if (hasRemoteCollaborationActivity.value) {
+    const roleTextValue = currentCollaborationActivityRole.value === 'admin' ? '管理员' : '专家'
+    return `${roleTextValue}${currentCollaborationActivityUsername.value || '其他用户'} ${collaborationActivityText.value || '正在框选文本'}，当前尚未锁定报告`
+  }
   if (isCurrentUserEditor.value) {
     return `${collaborationActivityText.value || '当前由你操控'}，停止操作几秒后，其他协作者可接管`
   }
@@ -608,7 +761,7 @@ const visibleColumns = computed(() => {
 })
 
 watch(visibleColumnKeys, (val) => {
-  localStorage.setItem(TASK_COLUMNS_STORAGE_KEY, JSON.stringify(val))
+  persistVisibleColumnKeys(val)
 }, { deep: true })
 
 const getStatusText = (reportLike) => {
@@ -620,7 +773,7 @@ const getStatusText = (reportLike) => {
     SUBMITTED: '已标注',
     REVIEW_ASSIGNED: '待复核',
     REVIEW_IN_PROGRESS: '复核中',
-    DONE: '已标注'
+    DONE: '已完成'
   }
   const displayStatus = getDisplayStatus(reportLike)
   return map[displayStatus] || baseStatus || displayStatus
@@ -628,7 +781,8 @@ const getStatusText = (reportLike) => {
 
 const getStatusType = (reportLike) => {
   const displayStatus = getDisplayStatus(reportLike)
-  if (displayStatus === 'SUBMITTED' || displayStatus === 'DONE') return 'success'
+  if (displayStatus === 'DONE') return 'success'
+  if (displayStatus === 'SUBMITTED') return 'primary'
   if (displayStatus === 'IN_PROGRESS' || displayStatus === 'REVIEW_ASSIGNED' || displayStatus === 'REVIEW_IN_PROGRESS') return 'warning'
   return 'info'
 }
@@ -677,6 +831,10 @@ const buildLocalCollaborationFallbackState = (reportId, options = {}) => {
     current_editor_user_id: isEditor ? me.id : null,
     current_editor_username: isEditor ? me.username : null,
     current_editor_role: isEditor ? me.role : null,
+    current_activity_user_id: isEditor ? me.id : null,
+    current_activity_username: isEditor ? me.username : null,
+    current_activity_role: isEditor ? me.role : null,
+    current_activity_is_editor: isEditor,
     current_activity: isEditor ? localCollaborationActivity.value : null,
     is_edit_locked: false,
     can_edit: canEdit,
@@ -765,6 +923,10 @@ const buildCollaborationStateRenderSignature = (state) => {
     toSignaturePart(state.current_editor_user_id),
     toSignaturePart(state.current_editor_username),
     toSignaturePart(state.current_editor_role),
+    toSignaturePart(state.current_activity_user_id),
+    toSignaturePart(state.current_activity_username),
+    toSignaturePart(state.current_activity_role),
+    state.current_activity_is_editor ? '1' : '0',
     state.is_edit_locked ? '1' : '0',
     state.can_edit ? '1' : '0',
     buildActivityRenderSignature(state.current_activity)
@@ -776,8 +938,12 @@ const highlightCardsSignature = computed(() => {
 })
 
 const remoteCollaborationHighlightSignature = computed(() => {
-  if (isCurrentUserEditor.value) return ''
-  return buildActivityRenderSignature(currentCollaborationActivity.value)
+  if (!hasRemoteCollaborationActivity.value) return ''
+  return [
+    toSignaturePart(currentCollaborationActivityUserId.value),
+    currentCollaborationActivityIsEditor.value ? '1' : '0',
+    buildActivityRenderSignature(currentCollaborationActivity.value)
+  ].join('@@')
 })
 
 const clearHighlightHtmlCache = (field = null) => {
@@ -829,10 +995,16 @@ const setLocalCollaborationActivity = (activity) => {
 
 const clearLocalCollaborationActivity = () => {
   localCollaborationActivity.value = null
+  localSelectionActivityHoldUntil = 0
+}
+
+const getCollaborationIntentForLocalActivity = () => {
+  if (isCurrentUserEditor.value) return 'edit'
+  return localCollaborationActivity.value?.status === 'editing' ? 'edit' : 'view'
 }
 
 const getHeartbeatActivityPayload = (intent) => {
-  if (intent !== 'edit') return null
+  if (intent === 'release') return null
   return cloneCollaborationActivity(localCollaborationActivity.value)
 }
 
@@ -860,7 +1032,14 @@ const applyReportDetail = async (detail, options = {}) => {
     row.status = detail.status
     row.annotation_status = detail.annotation_status
     row.annotation_submitted_at = detail.annotation_submitted_at
+    row.review_completed_at = detail.review_completed_at
+    row.review_completed_user_ids = detail.review_completed_user_ids
+    row.review_completed_users = detail.review_completed_users
+    row.is_review_task = detail.is_review_task
+    row.is_current_user_assigned_reviewer = detail.is_current_user_assigned_reviewer
+    row.has_current_user_completed_review = detail.has_current_user_completed_review
   }
+  syncReportCollectionsFromAllReports()
 
   const preCards = buildPreCards(detail)
   const manualCards = buildManualCardsFromAnnotation(detail)
@@ -1284,11 +1463,21 @@ const syncCollaboration = async (intent = 'view', options = {}) => {
 
 const publishLocalCollaborationActivity = async () => {
   if (!currentReport.value?.id) return
+  const intent = getCollaborationIntentForLocalActivity()
+  const activitySignature = [
+    String(currentReport.value.id),
+    intent,
+    buildActivityRenderSignature(localCollaborationActivity.value)
+  ].join('@@')
+  if (activitySignature === lastPublishedActivitySignature) return
+  lastPublishedActivitySignature = activitySignature
 
   if (canUseCollaborationSocket(currentReport.value.id)) {
     try {
-      noteLocalEditActivity()
-      await sendCollaborationSocketIntent('edit', {
+      if (intent === 'edit') {
+        noteLocalEditActivity()
+      }
+      await sendCollaborationSocketIntent(intent, {
         reportId: currentReport.value.id,
         awaitState: false,
         announceLoss: false
@@ -1300,14 +1489,178 @@ const publishLocalCollaborationActivity = async () => {
     }
   }
 
-  await syncCollaborationHttp('edit', {
+  await syncCollaborationHttp(intent, {
     silent: true,
     reportId: currentReport.value.id,
     announceLoss: false
   })
 }
 
+const clearReportUpdatesSocketKeepAliveTimer = () => {
+  if (reportUpdatesSocketKeepAliveTimer) {
+    clearTimeout(reportUpdatesSocketKeepAliveTimer)
+    reportUpdatesSocketKeepAliveTimer = null
+  }
+}
+
+const clearReportUpdatesSocketReconnectTimer = () => {
+  if (reportUpdatesSocketReconnectTimer) {
+    clearTimeout(reportUpdatesSocketReconnectTimer)
+    reportUpdatesSocketReconnectTimer = null
+  }
+}
+
+const scheduleReportUpdatesSocketKeepAlive = (sessionId) => {
+  clearReportUpdatesSocketKeepAliveTimer()
+  if (
+    typeof window === 'undefined' ||
+    sessionId !== reportUpdatesSocketSessionId ||
+    !reportUpdatesSocket ||
+    reportUpdatesSocket.readyState !== WebSocket.OPEN
+  ) {
+    return
+  }
+
+  reportUpdatesSocketKeepAliveTimer = window.setTimeout(() => {
+    if (
+      sessionId !== reportUpdatesSocketSessionId ||
+      !reportUpdatesSocket ||
+      reportUpdatesSocket.readyState !== WebSocket.OPEN
+    ) {
+      return
+    }
+    try {
+      reportUpdatesSocket.send('ping')
+    } catch (_e) {
+      // ignore and let reconnect handle it
+    } finally {
+      scheduleReportUpdatesSocketKeepAlive(sessionId)
+    }
+  }, REPORT_UPDATES_WS_KEEPALIVE_MS)
+}
+
+const scheduleReportUpdatesSocketReconnect = (sessionId) => {
+  clearReportUpdatesSocketReconnectTimer()
+  if (typeof window === 'undefined' || sessionId !== reportUpdatesSocketSessionId) return
+
+  reportUpdatesSocketReconnectTimer = window.setTimeout(() => {
+    if (sessionId !== reportUpdatesSocketSessionId) return
+    startReportUpdatesSocket({
+      urlCandidates: reportUpdatesSocketUrlCandidates,
+      candidateIndex: reportUpdatesSocketUrlIndex
+    })
+  }, REPORT_UPDATES_WS_RECONNECT_MS)
+}
+
+const stopReportUpdatesSocket = (options = {}) => {
+  const { close = true } = options
+  reportUpdatesSocketSessionId += 1
+  clearReportUpdatesSocketKeepAliveTimer()
+  clearReportUpdatesSocketReconnectTimer()
+
+  const socket = reportUpdatesSocket
+  reportUpdatesSocket = null
+  reportUpdatesSocketUrlCandidates = []
+  reportUpdatesSocketUrlIndex = 0
+
+  if (close && socket) {
+    try {
+      socket.close(1000, 'normal-close')
+    } catch (_e) {
+      // ignore
+    }
+  }
+}
+
+const handleReportUpdatesMessage = async (payload) => {
+  if (payload?.type !== 'reports-updated') return
+  await loadReports({ silent: true })
+}
+
+const openReportUpdatesSocketCandidate = (sessionId, urlCandidates, candidateIndex) => {
+  const wsUrl = urlCandidates[candidateIndex]
+  if (!wsUrl || typeof WebSocket === 'undefined') return false
+
+  reportUpdatesSocketUrlCandidates = [...urlCandidates]
+  reportUpdatesSocketUrlIndex = candidateIndex
+
+  const socket = new WebSocket(wsUrl)
+  reportUpdatesSocket = socket
+  let opened = false
+
+  socket.addEventListener('open', () => {
+    if (sessionId !== reportUpdatesSocketSessionId || reportUpdatesSocket !== socket) {
+      try {
+        socket.close(1000, 'stale-connection')
+      } catch (_e) {
+        // ignore
+      }
+      return
+    }
+    opened = true
+    clearReportUpdatesSocketReconnectTimer()
+    scheduleReportUpdatesSocketKeepAlive(sessionId)
+    void loadReports({ silent: true })
+  })
+
+  socket.addEventListener('message', (event) => {
+    if (sessionId !== reportUpdatesSocketSessionId || reportUpdatesSocket !== socket) return
+    try {
+      const payload = JSON.parse(event.data || '{}')
+      void handleReportUpdatesMessage(payload)
+    } catch (_e) {
+      // ignore malformed payloads
+    }
+  })
+
+  socket.addEventListener('close', () => {
+    if (sessionId !== reportUpdatesSocketSessionId) return
+    clearReportUpdatesSocketKeepAliveTimer()
+    if (reportUpdatesSocket === socket) {
+      reportUpdatesSocket = null
+    }
+
+    if (!opened && candidateIndex + 1 < urlCandidates.length) {
+      openReportUpdatesSocketCandidate(sessionId, urlCandidates, candidateIndex + 1)
+      return
+    }
+
+    scheduleReportUpdatesSocketReconnect(sessionId)
+  })
+
+  socket.addEventListener('error', () => {
+    clearReportUpdatesSocketKeepAliveTimer()
+  })
+
+  return true
+}
+
+const startReportUpdatesSocket = (options = {}) => {
+  if (typeof WebSocket === 'undefined') return false
+  const {
+    urlCandidates = api.buildReportUpdatesWebSocketUrls(),
+    candidateIndex = 0
+  } = options
+  if (!Array.isArray(urlCandidates) || !urlCandidates.length) return false
+
+  stopReportUpdatesSocket()
+
+  const sessionId = reportUpdatesSocketSessionId
+  return openReportUpdatesSocketCandidate(
+    sessionId,
+    urlCandidates,
+    Math.max(0, Math.min(candidateIndex, urlCandidates.length - 1))
+  )
+}
+
 const handleDocumentVisibilityChange = () => {
+  const isVisible = typeof document === 'undefined' || !document.hidden
+  if (isVisible) {
+    if (!reportUpdatesSocket || reportUpdatesSocket.readyState !== WebSocket.OPEN) {
+      startReportUpdatesSocket()
+    }
+    void loadReports({ silent: true })
+  }
   const reportId = currentReport.value?.id
   if (!reportId) return
   if (requiresDistributionBeforeAnnotation.value || isViewOnlyAccessibleReport.value) return
@@ -1325,6 +1678,12 @@ const handleDocumentVisibilityChange = () => {
   }
   if (!collaborationUnavailable.value && typeof document !== 'undefined' && !document.hidden) {
     startCollaborationSocket(reportId)
+  }
+}
+
+const handleWindowResize = () => {
+  if (highlightTooltip.value.visible && activeTooltipAnchor) {
+    void showHighlightTooltip(activeTooltipAnchor)
   }
 }
 
@@ -1924,18 +2283,60 @@ const ensureDismissedSet = (reportId) => {
   return dismissedPreCardKeysByReport.get(reportId)
 }
 
+const getScopedStorageUserKey = () => {
+  const userId = currentUser.value?.id
+  return userId ? String(userId) : ''
+}
+
+const getTaskColumnsStorageKey = () => {
+  const userKey = getScopedStorageUserKey()
+  return userKey ? `${TASK_COLUMNS_STORAGE_KEY_PREFIX}:${userKey}` : ''
+}
+
+const getDismissedPreStorageKey = () => {
+  const userKey = getScopedStorageUserKey()
+  return userKey ? `${DISMISSED_PRE_STORAGE_KEY_PREFIX}:${userKey}` : ''
+}
+
+const persistVisibleColumnKeys = (columnKeys) => {
+  const storageKey = getTaskColumnsStorageKey()
+  if (!storageKey) return
+  localStorage.setItem(storageKey, JSON.stringify(columnKeys))
+  localStorage.removeItem(LEGACY_TASK_COLUMNS_STORAGE_KEY)
+}
+
+const restoreVisibleColumnKeys = () => {
+  const storageKey = getTaskColumnsStorageKey()
+  if (!storageKey) return
+  const storedColumns = localStorage.getItem(storageKey)
+  if (!storedColumns) return
+  try {
+    const parsed = JSON.parse(storedColumns)
+    const allowed = new Set(doctorTableColumns.map((item) => item.key))
+    const clean = Array.isArray(parsed) ? parsed.filter((key) => allowed.has(key)) : []
+    if (clean.length) visibleColumnKeys.value = clean
+  } catch (_e) {
+    localStorage.removeItem(storageKey)
+  }
+}
+
 const persistDismissedPreCardKeys = () => {
+  const storageKey = getDismissedPreStorageKey()
+  if (!storageKey) return
   const payload = {}
   dismissedPreCardKeysByReport.forEach((set, reportId) => {
     if (set.size > 0) {
       payload[String(reportId)] = Array.from(set)
     }
   })
-  localStorage.setItem(DISMISSED_PRE_STORAGE_KEY, JSON.stringify(payload))
+  localStorage.setItem(storageKey, JSON.stringify(payload))
+  localStorage.removeItem(LEGACY_DISMISSED_PRE_STORAGE_KEY)
 }
 
 const restoreDismissedPreCardKeys = () => {
-  const raw = localStorage.getItem(DISMISSED_PRE_STORAGE_KEY)
+  const storageKey = getDismissedPreStorageKey()
+  if (!storageKey) return
+  const raw = localStorage.getItem(storageKey)
   if (!raw) return
   try {
     const parsed = JSON.parse(raw)
@@ -1947,7 +2348,7 @@ const restoreDismissedPreCardKeys = () => {
       dismissedPreCardKeysByReport.set(numericReportId, new Set(keys.map((item) => String(item))))
     })
   } catch (_e) {
-    localStorage.removeItem(DISMISSED_PRE_STORAGE_KEY)
+    localStorage.removeItem(storageKey)
   }
 }
 
@@ -2080,7 +2481,9 @@ const buildHighlights = (field) => {
     })
     .filter(Boolean)
 
-  const remoteActivity = currentCollaborationActivity.value
+  const remoteActivity = hasRemoteCollaborationActivity.value
+    ? currentCollaborationActivity.value
+    : null
   if (
     remoteActivity &&
     !isCurrentUserEditor.value &&
@@ -2136,9 +2539,18 @@ const buildHighlights = (field) => {
 }
 
 const buildHighlightTooltip = (card) => {
+  if (card?.kind === 'collaboration-activity') {
+    return {
+      title: card.activity_status === 'selecting' ? '对方已选中' : '对方标注中',
+      text: card.alert_message || '协作者正在处理这段内容'
+    }
+  }
   const suggestionText = getCardSuggestionText(card)
   if (!suggestionText || suggestionText === '-') return ''
-  return suggestionText
+  return {
+    title: errorTypeText(card?.error_type),
+    text: suggestionText
+  }
 }
 
 const renderBadges = (cardsInRange) => {
@@ -2192,7 +2604,9 @@ const getHighlightedHtml = (field) => {
     const primaryCard = persistedCards[0] || collaborationCard || h.cards[0]
     const badge = renderBadges(persistedCards)
     const tooltipText = buildHighlightTooltip(primaryCard)
-    const tooltipAttr = tooltipText ? ` data-tooltip="${escapeHtml(tooltipText)}"` : ''
+    const tooltipAttr = tooltipText
+      ? ` data-tooltip-title="${escapeHtml(tooltipText.title || '')}" data-tooltip="${escapeHtml(tooltipText.text || '')}"`
+      : ''
 
     if (h.missing || safeStart === safeEnd) {
       const missingText = primaryCard.source || '缺失文本'
@@ -2232,11 +2646,13 @@ const getClosestTooltipChip = (target) => {
 const hideHighlightTooltip = () => {
   activeTooltipAnchor = null
   highlightTooltip.value.visible = false
+  highlightTooltip.value.title = ''
   highlightTooltip.value.text = ''
 }
 
 const showHighlightTooltip = async (chipEl) => {
   const tooltipText = normalizeInputText(chipEl?.dataset?.tooltip)
+  const tooltipTitle = normalizeInputText(chipEl?.dataset?.tooltipTitle)
   if (!chipEl || !tooltipText) {
     hideHighlightTooltip()
     return
@@ -2244,6 +2660,7 @@ const showHighlightTooltip = async (chipEl) => {
 
   activeTooltipAnchor = chipEl
   highlightTooltip.value.visible = true
+  highlightTooltip.value.title = tooltipTitle
   highlightTooltip.value.text = tooltipText
 
   await nextTick()
@@ -2346,9 +2763,11 @@ const buildPayload = () => {
   }
 }
 
-const loadReports = async () => {
+const loadReports = async (options = {}) => {
+  const { silent = false } = options
+  const requestSeq = ++reportListLoadRequestSeq
   const params = {
-    tab: props.isAdminMode ? 'all' : activeFilter.value,
+    tab: 'all',
     page: 1,
     page_size: DOCTOR_LIST_PAGE_SIZE,
     only_mine: props.isAdminMode ? false : onlyMine.value,
@@ -2357,15 +2776,19 @@ const loadReports = async () => {
   if (reportQuery.value) params.q = reportQuery.value
 
   const res = await api.getDoctorReports(params)
+  if (requestSeq !== reportListLoadRequestSeq) return
   allReportList.value = res.items || []
-  if (props.isAdminMode) {
-    reportList.value = filterAdminReports(allReportList.value)
-    reportTotal.value = reportList.value.length
-    progress.value = buildAdminProgress(allReportList.value)
-  } else {
-    reportList.value = allReportList.value
-    reportTotal.value = res.total || 0
-    progress.value = res.progress || { done: 0, total: 0 }
+
+  syncReportCollectionsFromAllReports()
+  annotationProgress.value = res.annotation_progress || annotationProgress.value
+  reviewProgress.value = res.review_progress || reviewProgress.value
+
+  if (silent) {
+    const currentRow = currentReport.value
+      ? reportList.value.find((item) => item.id === currentReport.value.id)
+      : null
+    doctorTableRef.value?.setCurrentRow(currentRow || null)
+    return
   }
 
   if (!currentReport.value && reportList.value.length > 0) {
@@ -2532,20 +2955,19 @@ const openReport = async (report) => {
   await startCollaborationRealtime()
 }
 
-const refreshAdminProgress = () => {
-  if (!props.isAdminMode) return
-  progress.value = buildAdminProgress(allReportList.value)
-}
-
-const updateCurrentReportStatusLocally = (status) => {
+const updateCurrentReportStatusLocally = (status, options = {}) => {
+  const { refreshCollections = true } = options
   if (!currentReport.value) return
   currentReport.value.status = status
   const row = allReportList.value.find((item) => item.id === currentReport.value.id) || reportList.value.find((item) => item.id === currentReport.value.id)
   if (row) row.status = status
-  refreshAdminProgress()
+  if (refreshCollections) {
+    syncReportCollectionsFromAllReports()
+  }
 }
 
-const updateCurrentAnnotationStatusLocally = (status) => {
+const updateCurrentAnnotationStatusLocally = (status, options = {}) => {
+  const { refreshCollections = true } = options
   if (!currentReport.value) return
   currentReport.value.annotation_status = status
   if (currentReport.value.annotation) {
@@ -2555,22 +2977,27 @@ const updateCurrentAnnotationStatusLocally = (status) => {
   if (row) {
     row.annotation_status = status
   }
-  refreshAdminProgress()
+  if (refreshCollections) {
+    syncReportCollectionsFromAllReports()
+  }
 }
 
 const markCurrentReportSubmittedLocally = () => {
   if (!currentReport.value) return
   if (['REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS'].includes(resolveBaseStatus(currentReport.value))) {
-    updateCurrentReportStatusLocally('DONE')
-    updateCurrentAnnotationStatusLocally('SUBMITTED')
+    updateCurrentReportStatusLocally('DONE', { refreshCollections: false })
+    updateCurrentAnnotationStatusLocally('SUBMITTED', { refreshCollections: false })
+    syncReportCollectionsFromAllReports()
     return
   }
   if (isAdminImportedReport(currentReport.value)) {
-    updateCurrentAnnotationStatusLocally('SUBMITTED')
+    updateCurrentAnnotationStatusLocally('SUBMITTED', { refreshCollections: false })
+    syncReportCollectionsFromAllReports()
     return
   }
-  updateCurrentReportStatusLocally('SUBMITTED')
-  updateCurrentAnnotationStatusLocally('SUBMITTED')
+  updateCurrentReportStatusLocally('SUBMITTED', { refreshCollections: false })
+  updateCurrentAnnotationStatusLocally('SUBMITTED', { refreshCollections: false })
+  syncReportCollectionsFromAllReports()
 }
 
 const autoSaveAfterInteraction = async () => {
@@ -2778,21 +3205,23 @@ const readCurrentSelectionContext = () => {
 const commitSelectionContext = async (selectionContext) => {
   if (!currentReport.value || requiresDistributionBeforeAnnotation.value || isViewOnlyAccessibleReport.value) return
   setLocalCollaborationActivity(buildCollaborationActivityFromSelection(selectionContext))
-  const hasAccess = await ensureEditAccess('选中文本')
-  if (!hasAccess) {
-    clearLocalCollaborationActivity()
-    return
-  }
+  localSelectionActivityHoldUntil = Date.now() + LOCAL_SELECTION_ACTIVITY_HOLD_MS
   await publishLocalCollaborationActivity()
 }
 
 const syncSelectionClearToCollaboration = async () => {
   if (!currentReport.value || requiresDistributionBeforeAnnotation.value || isViewOnlyAccessibleReport.value) return
   if (localCollaborationActivity.value?.status !== 'selecting') return
-  clearLocalCollaborationActivity()
-  if (isCurrentUserEditor.value) {
-    await publishLocalCollaborationActivity()
+  const remainingHoldMs = localSelectionActivityHoldUntil - Date.now()
+  if (remainingHoldMs > 0) {
+    clearCollaborationSelectionSyncTimer()
+    collaborationSelectionSyncTimer = window.setTimeout(() => {
+      void syncSelectionClearToCollaboration()
+    }, remainingHoldMs)
+    return
   }
+  clearLocalCollaborationActivity()
+  await publishLocalCollaborationActivity()
 }
 
 const handleSectionSelectionMouseUp = async () => {
@@ -2823,9 +3252,7 @@ const handleDocumentSelectionChange = () => {
       const currentSignature = buildActivityRenderSignature(localCollaborationActivity.value)
       if (nextSignature === currentSignature) return
       setLocalCollaborationActivity(nextActivity)
-      if (isCurrentUserEditor.value) {
-        await publishLocalCollaborationActivity()
-      }
+      await publishLocalCollaborationActivity()
     })()
   }, COLLABORATION_SELECTION_SYNC_DEBOUNCE_MS)
 }
@@ -2966,6 +3393,8 @@ const clearCurrentReport = () => {
   collaborationUnavailable.value = false
   collaborationUnavailableNotified.value = false
   localCollaborationActivity.value = null
+  localSelectionActivityHoldUntil = 0
+  lastPublishedActivitySignature = ''
   currentAnnotationUpdatedAt.value = null
   remoteAnnotationRefreshing.value = false
   clearHighlightHtmlCache()
@@ -3078,12 +3507,13 @@ const cancelSubmittedAnnotation = async () => {
   const hasAccess = await ensureEditAccess('取消标注')
   if (!hasAccess) return
   const reportId = currentReport.value.id
-  const isReviewTask = currentDisplayStatus.value === 'REVIEW_ASSIGNED'
-  const confirmText = isReviewTask
+  const previousFilter = activeFilter.value
+  const reportIsReviewTask = isReviewTask(currentReport.value)
+  const confirmText = reportIsReviewTask
     ? '确认后将进入复核修改状态，是否继续？'
     : '取消后，当前报告将回到待标注状态，是否继续？'
-  const titleText = isReviewTask ? '开始复核修改' : '取消标注确认'
-  const successText = isReviewTask
+  const titleText = reportIsReviewTask ? '开始复核修改' : '取消标注确认'
+  const successText = reportIsReviewTask
     ? '已进入复核修改状态，请完成核验后提交'
     : '已取消标注，当前报告已恢复为可编辑状态'
   try {
@@ -3102,8 +3532,11 @@ const cancelSubmittedAnnotation = async () => {
     setCurrentAnnotationUpdatedAt(new Date().toISOString())
     ElMessage.success(successText)
     await loadReports()
-    if (activeFilter.value === 'annotated' && reportList.value.length === 0) {
+    if (previousFilter === 'annotated' && reportList.value.length === 0) {
       activeFilter.value = 'unannotated'
+      await loadReports()
+    } else if (previousFilter === 'reviewed' && reportList.value.length === 0) {
+      activeFilter.value = 'review'
       await loadReports()
     }
     const refreshed = reportList.value.find((item) => item.id === reportId)
@@ -3148,6 +3581,10 @@ onBeforeUnmount(() => {
   clearCardFocus()
   hideHighlightTooltip()
   clearCollaborationSelectionSyncTimer()
+  stopReportUpdatesSocket()
+  if (typeof window !== 'undefined') {
+    window.removeEventListener('resize', handleWindowResize)
+  }
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleDocumentVisibilityChange)
     document.removeEventListener('mouseup', handleDocumentMouseUp)
@@ -3158,16 +3595,12 @@ onBeforeUnmount(() => {
 
 onMounted(async () => {
   try {
-    const storedColumns = localStorage.getItem(TASK_COLUMNS_STORAGE_KEY)
-    if (storedColumns) {
-      const parsed = JSON.parse(storedColumns)
-      const allowed = new Set(doctorTableColumns.map((item) => item.key))
-      const clean = Array.isArray(parsed) ? parsed.filter((key) => allowed.has(key)) : []
-      if (clean.length) visibleColumnKeys.value = clean
-    }
-    restoreDismissedPreCardKeys()
-
     currentUser.value = api.getCurrentUser() || await api.getMe()
+    restoreVisibleColumnKeys()
+    restoreDismissedPreCardKeys()
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', handleWindowResize)
+    }
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleDocumentVisibilityChange)
       document.addEventListener('mouseup', handleDocumentMouseUp)
@@ -3177,6 +3610,7 @@ onMounted(async () => {
       onlyMine.value = false
     }
     await loadReports()
+    startReportUpdatesSocket()
   } catch (e) {
     ElMessage.error(e.message || '加载医生任务失败')
   }
@@ -3474,6 +3908,19 @@ onMounted(async () => {
   z-index: 1200;
 }
 
+.floating-highlight-tooltip-title {
+  margin-bottom: 6px;
+  color: #991b1b;
+  font-size: 15px;
+  line-height: 1.4;
+  font-weight: 900;
+  letter-spacing: 0.01em;
+}
+
+.floating-highlight-tooltip-body {
+  white-space: pre-wrap;
+}
+
 .section-content :deep(.hl-chip.pre) {
   background: #fef3c7;
   color: #92400e;
@@ -3486,10 +3933,10 @@ onMounted(async () => {
 }
 
 .section-content :deep(.hl-chip.hl-collaboration-live) {
-  background: #fff7ed;
-  color: #9a3412;
-  border: 1px dashed #fb923c;
-  box-shadow: 0 0 0 2px rgba(251, 146, 60, 0.12);
+  background: rgba(254, 226, 226, 0.9);
+  color: #991b1b;
+  border: 1px dashed #ef4444;
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.12);
 }
 
 .section-content :deep(.hl-chip.hl-delete) {
@@ -3557,13 +4004,14 @@ onMounted(async () => {
   display: inline-flex;
   align-items: center;
   margin-left: 6px;
-  padding: 1px 6px;
+  padding: 1px 7px;
   border-radius: 999px;
-  background: rgba(249, 115, 22, 0.16);
-  color: #c2410c;
+  border: 1px solid rgba(239, 68, 68, 0.32);
+  background: rgba(254, 226, 226, 0.96);
+  color: #b91c1c;
   font-size: 11px;
   line-height: 1.4;
-  font-weight: 600;
+  font-weight: 700;
 }
 
 @keyframes chip-focus-pulse {
@@ -3812,16 +4260,17 @@ onMounted(async () => {
 .error-type-emphasis {
   display: inline-flex;
   align-items: center;
-  padding: 1px 8px;
+  padding: 2px 10px;
   border-radius: 999px;
   background: #fee2e2;
   color: #b91c1c;
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .error-type-emphasis.header {
-  padding: 3px 10px;
+  padding: 4px 12px;
+  font-size: 14px;
 }
 
 .card-actions {

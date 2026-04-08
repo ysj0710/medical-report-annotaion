@@ -17,6 +17,9 @@ class ReportResponse(BaseModel):
     reviewer_doctor_id: Optional[int] = None
     review_assigned_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = None
+    review_completed_at: Optional[datetime] = None
+    review_completed_user_ids: List[int] = []
+    review_completed_users: List[dict[str, Any]] = []
     submitted_at: Optional[datetime]
 
     # 扩展字段
@@ -41,6 +44,7 @@ class ReportResponse(BaseModel):
     annotation_data: Optional[Any] = None
     annotation_status: Optional[str] = None
     annotation_submitted_at: Optional[datetime] = None
+    is_review_task: bool = False
 
     class Config:
         from_attributes = True

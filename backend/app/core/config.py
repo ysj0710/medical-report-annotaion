@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-BACKEND_DIR = Path(__file__).resolve().parents[2]
+BACKEND_DIR = Path(__file__).resolve().parents[2]  # backend/app/core -> backend
 ENV_FILE = BACKEND_DIR / ".env"
 
 
@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     )
 
     APP_NAME: str = "Medical Report Annotation"
-    DATABASE_URL: str = "postgresql+psycopg2://enjoy0710:@localhost:5432/med_anno"
+    DATABASE_URL: str = "postgresql+psycopg2://enjoy0710@127.0.0.1:5432/med_anno"
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
 

@@ -35,6 +35,13 @@ class AnnotationResponse(BaseModel):
         from_attributes = True
 
 
+class DoctorReviewUserResponse(BaseModel):
+    id: int
+    username: str
+    role: str
+    employee_id: Optional[str] = None
+
+
 class DoctorReportResponse(BaseModel):
     id: int
     external_id: Optional[str]
@@ -57,9 +64,15 @@ class DoctorReportResponse(BaseModel):
     reviewer_doctor_id: Optional[int] = None
     review_assigned_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = None
+    review_completed_at: Optional[datetime] = None
+    review_completed_user_ids: List[int] = []
+    review_completed_users: List[DoctorReviewUserResponse] = []
     submitted_at: Optional[datetime]
     annotation_status: Optional[str] = None
     annotation_submitted_at: Optional[datetime] = None
+    is_review_task: bool = False
+    is_current_user_assigned_reviewer: bool = False
+    has_current_user_completed_review: bool = False
     pre_annotations: Optional[List[Any]] = None  # 预标注错误列表
     annotation: Optional[AnnotationResponse] = None
 
@@ -78,6 +91,8 @@ class DoctorReportListResponse(BaseModel):
     page_size: int
     total: int
     progress: DoctorProgressResponse
+    annotation_progress: DoctorProgressResponse
+    review_progress: DoctorProgressResponse
 
 
 class DraftRequest(BaseModel):
@@ -138,6 +153,10 @@ class CollaborationStateResponse(BaseModel):
     current_editor_user_id: Optional[int] = None
     current_editor_username: Optional[str] = None
     current_editor_role: Optional[str] = None
+    current_activity_user_id: Optional[int] = None
+    current_activity_username: Optional[str] = None
+    current_activity_role: Optional[str] = None
+    current_activity_is_editor: bool = False
     current_activity: Optional[CollaborationActivityResponse] = None
     is_edit_locked: bool = False
     can_edit: bool = True

@@ -2,11 +2,16 @@ from typing import Optional
 from datetime import datetime, timedelta, timezone
 from anyio import from_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
-from sqlalchemy import case, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, load_only
 from ...core.database import get_db, SessionLocal
-from ...core.collaboration_ws import collaboration_socket_hub, CollaborationSocketClient
+from ...core.collaboration_ws import (
+    collaboration_socket_hub,
+    CollaborationSocketClient,
+    report_updates_socket_hub,
+    ReportUpdatesSocketClient
+)
 from ...models.user import User
 from ...models.report import Report
 from ...models.annotation import Annotation
@@ -32,6 +37,102 @@ COLLAB_VIEW_TTL_SECONDS = 15
 COLLAB_LOCK_TTL_SECONDS = 8
 COLLAB_ACTIVITY_LABEL_MAX_LENGTH = 120
 COLLAB_SELECTION_TEXT_MAX_LENGTH = 96
+ANNOTATION_DONE_STATUSES = {STATUS_SUBMITTED, STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS, STATUS_DONE}
+REVIEW_ACTIVE_STATUSES = {STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS}
+
+
+def _normalize_annotation_user_ids(raw_value) -> list[int]:
+    if not isinstance(raw_value, list):
+        return []
+
+    normalized_ids: list[int] = []
+    seen_ids: set[int] = set()
+    for item in raw_value:
+        try:
+            user_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0 or user_id in seen_ids:
+            continue
+        seen_ids.add(user_id)
+        normalized_ids.append(user_id)
+    return normalized_ids
+
+
+def _append_annotation_user_id(annotation: Annotation, user_id: Optional[int]) -> None:
+    if not user_id:
+        return
+    user_ids = _normalize_annotation_user_ids(annotation.annotation_user_ids)
+    if user_id not in user_ids:
+        user_ids.append(user_id)
+    annotation.annotation_user_ids = user_ids
+
+
+def _normalize_review_completed_user_ids(raw_value) -> list[int]:
+    return _normalize_annotation_user_ids(raw_value)
+
+
+def _append_review_completed_user_id(report: Report, user_id: Optional[int]) -> list[int]:
+    if not user_id:
+        return _normalize_review_completed_user_ids(report.review_completed_user_ids)
+    user_ids = _normalize_review_completed_user_ids(report.review_completed_user_ids)
+    if user_id not in user_ids:
+        user_ids.append(user_id)
+    report.review_completed_user_ids = user_ids
+    return user_ids
+
+
+def _read_field(source, name: str):
+    if isinstance(source, dict):
+        return source.get(name)
+    return getattr(source, name, None)
+
+
+def _is_review_task(source) -> bool:
+    return bool(
+        _read_field(source, "status") in REVIEW_ACTIVE_STATUSES
+        or _read_field(source, "reviewer_doctor_id")
+        or _read_field(source, "review_assigned_at")
+        or _normalize_review_completed_user_ids(_read_field(source, "review_completed_user_ids"))
+    )
+
+
+def _is_annotation_done(source) -> bool:
+    return bool(
+        _read_field(source, "status") in ANNOTATION_DONE_STATUSES
+        or _read_field(source, "annotation_status") == "SUBMITTED"
+    )
+
+
+def _is_review_done(source) -> bool:
+    return bool(
+        _is_review_task(source)
+        and (
+            _read_field(source, "status") == STATUS_DONE
+            or _read_field(source, "reviewed_at")
+            or _normalize_review_completed_user_ids(_read_field(source, "review_completed_user_ids"))
+        )
+    )
+
+
+def _build_review_user_payload(user: Optional[User]) -> Optional[dict]:
+    if not user:
+        return None
+    return {
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "employee_id": user.employee_id
+    }
+
+
+def _build_review_completed_users(report: Report, user_by_id: dict[int, User]) -> list[dict]:
+    results: list[dict] = []
+    for user_id in _normalize_review_completed_user_ids(report.review_completed_user_ids):
+        payload = _build_review_user_payload(user_by_id.get(user_id))
+        if payload:
+            results.append(payload)
+    return results
 
 
 def _utcnow() -> datetime:
@@ -234,20 +335,12 @@ def _build_collaboration_state(
 
     participant_items = []
     current_editor_user = None
+    current_activity_owner = None
     current_activity = None
     for session in sessions:
         is_editor = bool(active_lock_user_id and active_lock_user_id == session.user_id)
         if is_editor:
             current_editor_user = session
-            if session.active_status:
-                current_activity = CollaborationActivityResponse(
-                    status=session.active_status,
-                    label=session.active_label,
-                    content_type=session.active_content_type,
-                    selection_start=session.active_selection_start,
-                    selection_end=session.active_selection_end,
-                    selection_text=session.active_selection_text
-                )
         participant_items.append(CollaborationParticipantResponse(
             user_id=session.user_id,
             username=session.username,
@@ -264,6 +357,35 @@ def _build_collaboration_state(
         item.username
     ))
 
+    def _activity_sort_key(session) -> tuple[datetime, datetime, int]:
+        return (
+            _ensure_utc(session.last_activity_at) or datetime.min.replace(tzinfo=timezone.utc),
+            _ensure_utc(session.last_seen_at) or datetime.min.replace(tzinfo=timezone.utc),
+            session.user_id
+        )
+
+    if current_editor_user:
+        current_activity_owner = current_editor_user
+    else:
+        activity_candidates = [session for session in sessions if session.active_status]
+        remote_activity_candidates = [
+            session for session in activity_candidates
+            if session.user_id != current_user.id
+        ]
+        prioritized_candidates = remote_activity_candidates or activity_candidates
+        prioritized_candidates.sort(key=_activity_sort_key, reverse=True)
+        current_activity_owner = prioritized_candidates[0] if prioritized_candidates else None
+
+    if current_activity_owner and current_activity_owner.active_status:
+        current_activity = CollaborationActivityResponse(
+            status=current_activity_owner.active_status,
+            label=current_activity_owner.active_label,
+            content_type=current_activity_owner.active_content_type,
+            selection_start=current_activity_owner.active_selection_start,
+            selection_end=current_activity_owner.active_selection_end,
+            selection_text=current_activity_owner.active_selection_text
+        )
+
     annotation_updated_at = db.query(Annotation.updated_at).filter(
         Annotation.report_id == report_id
     ).scalar()
@@ -275,6 +397,14 @@ def _build_collaboration_state(
         current_editor_user_id=current_editor_user_id,
         current_editor_username=current_editor_user.username if current_editor_user else None,
         current_editor_role=current_editor_user.role if current_editor_user else None,
+        current_activity_user_id=current_activity_owner.user_id if current_activity_owner else None,
+        current_activity_username=current_activity_owner.username if current_activity_owner else None,
+        current_activity_role=current_activity_owner.role if current_activity_owner else None,
+        current_activity_is_editor=bool(
+            current_activity_owner
+            and active_lock_user_id
+            and current_activity_owner.user_id == active_lock_user_id
+        ),
         current_activity=current_activity,
         is_edit_locked=bool(user_can_edit and active_lock_user_id and active_lock_user_id != current_user.id),
         can_edit=bool(user_can_edit and (not active_lock_user_id or active_lock_user_id == current_user.id)),
@@ -377,6 +507,41 @@ def _schedule_collaboration_state_broadcast(report_id: int) -> None:
         print(f"Collaboration websocket broadcast skipped for report {report_id}: {exc}")
 
 
+async def _broadcast_report_updates_event(event_payload: dict) -> None:
+    clients = await report_updates_socket_hub.get_clients()
+    if not clients:
+        return
+
+    for client in clients:
+        try:
+            await client.websocket.send_json(event_payload)
+        except Exception:
+            await report_updates_socket_hub.disconnect(client)
+
+
+def _schedule_report_updates_broadcast(
+    event: str,
+    report_id: Optional[int] = None,
+    *,
+    status: Optional[str] = None,
+    annotation_status: Optional[str] = None,
+    review_completed_user_ids: Optional[list[int]] = None
+) -> None:
+    payload = {
+        "type": "reports-updated",
+        "event": event,
+        "report_id": report_id,
+        "status": status,
+        "annotation_status": annotation_status,
+        "review_completed_user_ids": review_completed_user_ids,
+        "at": _utcnow().isoformat()
+    }
+    try:
+        from_thread.run(_broadcast_report_updates_event, payload)
+    except Exception as exc:
+        print(f"Report updates websocket broadcast skipped for report {report_id}: {exc}")
+
+
 def _build_lock_conflict_message(db: Session, report_id: int, current_user: User) -> str:
     try:
         state = _build_collaboration_state(db, report_id, current_user, granted=False)
@@ -430,6 +595,10 @@ def _build_collaboration_fallback_state(
         current_editor_user_id=current_editor_user_id,
         current_editor_username=current_editor_username,
         current_editor_role=current_editor_role,
+        current_activity_user_id=current_user.id if granted and user_can_edit else None,
+        current_activity_username=current_user.username if granted and user_can_edit else None,
+        current_activity_role=current_user.role if granted and user_can_edit else None,
+        current_activity_is_editor=bool(granted and user_can_edit),
         current_activity=CollaborationActivityResponse(
             status="editing",
             label="正在协同标注",
@@ -461,13 +630,14 @@ def _run_collaboration_intent(
             _release_edit_lock(db, report_id, current_user)
             _remove_collaboration_session(db, report_id, current_user)
         else:
+            session_activity = activity if intent in {"view", "edit"} else None
             _touch_collaboration_session(
                 db,
                 report_id,
                 current_user,
                 now,
-                with_activity=(intent == "edit"),
-                activity=activity if intent == "edit" else None
+                with_activity=bool(session_activity) or intent == "edit",
+                activity=session_activity
             )
 
         if intent == "edit":
@@ -505,8 +675,6 @@ def list_doctor_reports(
     current_user: User = Depends(require_role(["doctor", "admin"]))
 ):
     """医生端报告列表"""
-    annotated_statuses = [STATUS_SUBMITTED, STATUS_DONE]
-
     # 根据 can_view_all 权限决定过滤条件
     if current_user.role == "admin":
         query = db.query(Report).filter(Report.is_cancel == False)
@@ -520,29 +688,6 @@ def list_doctor_reports(
             Report.is_cancel == False
         )
 
-    if lite:
-        query = query.options(load_only(
-            Report.id,
-            Report.external_id,
-            Report.ris_no,
-            Report.imported_at,
-            Report.modality,
-            Report.patient_name,
-            Report.patient_sex,
-            Report.patient_age,
-            Report.exam_item,
-            Report.exam_mode,
-            Report.exam_group,
-            Report.status,
-            Report.assigned_doctor_id,
-            Report.assigned_at,
-            Report.annotator_doctor_id,
-            Report.reviewer_doctor_id,
-            Report.review_assigned_at,
-            Report.reviewed_at,
-            Report.submitted_at,
-        ))
-
     if q:
         query = query.filter(
             (Report.ris_no.ilike(f"%{q}%")) |
@@ -551,63 +696,173 @@ def list_doctor_reports(
         )
 
     base_query = query
-    progress_total, progress_done = base_query.with_entities(
-        func.count(Report.id),
-        func.coalesce(
-            func.sum(case((Report.status.in_(annotated_statuses), 1), else_=0)),
-            0
+    review_task_condition = or_(
+        Report.status.in_(list(REVIEW_ACTIVE_STATUSES)),
+        Report.reviewer_doctor_id.is_not(None),
+        Report.review_assigned_at.is_not(None),
+        Report.review_completed_at.is_not(None),
+        Report.reviewed_at.is_not(None)
+    )
+    review_done_condition = and_(
+        review_task_condition,
+        or_(
+            Report.status == STATUS_DONE,
+            Report.review_completed_at.is_not(None),
+            Report.reviewed_at.is_not(None)
         )
-    ).one()
+    )
+    annotation_done_condition = or_(
+        and_(
+            Report.status == STATUS_SUBMITTED,
+            Report.reviewer_doctor_id.is_(None)
+        ),
+        and_(
+            Annotation.status == "SUBMITTED",
+            Report.reviewer_doctor_id.is_(None),
+            Report.status.notin_(list(REVIEW_ACTIVE_STATUSES) + [STATUS_DONE])
+        )
+    )
+
+    annotation_total_condition = ~review_task_condition
+
+    annotation_total, annotation_done_total, review_total, review_done_total = base_query.outerjoin(
+        Annotation, Annotation.report_id == Report.id
+    ).with_entities(
+        func.coalesce(func.sum(case((annotation_total_condition, 1), else_=0)), 0),
+        func.coalesce(func.sum(case((annotation_done_condition, 1), else_=0)), 0),
+        func.coalesce(func.sum(case((review_task_condition, 1), else_=0)), 0),
+        func.coalesce(func.sum(case((review_done_condition, 1), else_=0)), 0)
+    ).order_by(None).one()
+
+    annotation_progress = DoctorProgressResponse(
+        done=annotation_done_total or 0,
+        total=annotation_total or 0
+    )
+    review_progress = DoctorProgressResponse(
+        done=review_done_total or 0,
+        total=review_total or 0
+    )
 
     # 按 tab 筛选状态
     if tab == "unannotated":
-        query = query.filter(Report.status.in_([STATUS_ASSIGNED, STATUS_IN_PROGRESS, STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS]))
+        query = query.filter(
+            Report.status.in_([STATUS_IMPORTED, STATUS_ASSIGNED, STATUS_IN_PROGRESS]),
+            Report.reviewer_doctor_id.is_(None)
+        )
     elif tab == "annotated":
-        query = query.filter(Report.status.in_(annotated_statuses))
+        query = query.filter(
+            or_(
+                Report.status == STATUS_DONE,
+                and_(Report.status == STATUS_SUBMITTED, Report.reviewer_doctor_id.is_(None))
+            )
+        )
+    elif tab == "review":
+        query = query.filter(Report.status.in_(list(REVIEW_ACTIVE_STATUSES)))
     elif tab == "no_error":
         query = query.join(Annotation, Annotation.report_id == Report.id).filter(
-            Report.status.in_(annotated_statuses),
+            Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]),
             Annotation.data.contains({"no_error": True})
         ).distinct(Report.id)
 
     if tab == "all":
         query = query.order_by(
-            case((Report.status.in_(annotated_statuses), 1), else_=0),
+            case((Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]), 1), else_=0),
             Report.id.asc()
         )
     else:
         query = query.order_by(Report.id.asc())
 
-    total = query.count()
-    paged_reports = query.offset((page - 1) * page_size).limit(page_size).all()
+    total = query.order_by(None).count()
+    user_by_id: dict[int, User] = {}
+    if lite:
+        paged_rows = query.outerjoin(
+            Annotation, Annotation.report_id == Report.id
+        ).with_entities(
+            Report.id.label("id"),
+            Report.external_id.label("external_id"),
+            Report.ris_no.label("ris_no"),
+            Report.imported_at.label("imported_at"),
+            Report.modality.label("modality"),
+            Report.patient_name.label("patient_name"),
+            Report.patient_sex.label("patient_sex"),
+            Report.patient_age.label("patient_age"),
+            Report.exam_item.label("exam_item"),
+            Report.exam_mode.label("exam_mode"),
+            Report.exam_group.label("exam_group"),
+            Report.status.label("status"),
+            Report.assigned_doctor_id.label("assigned_doctor_id"),
+            Report.assigned_at.label("assigned_at"),
+            Report.annotator_doctor_id.label("annotator_doctor_id"),
+            Report.reviewer_doctor_id.label("reviewer_doctor_id"),
+            Report.review_assigned_at.label("review_assigned_at"),
+            Report.reviewed_at.label("reviewed_at"),
+            Report.review_completed_at.label("review_completed_at"),
+            Report.review_completed_user_ids.label("review_completed_user_ids"),
+            Report.submitted_at.label("submitted_at"),
+            Annotation.status.label("annotation_status"),
+            Annotation.submitted_at.label("annotation_submitted_at")
+        ).offset((page - 1) * page_size).limit(page_size).all()
+    else:
+        query = query.options(load_only(
+            Report.id,
+            Report.external_id,
+            Report.ris_no,
+            Report.report_text,
+            Report.imported_at,
+            Report.modality,
+            Report.patient_name,
+            Report.patient_sex,
+            Report.patient_age,
+            Report.exam_item,
+            Report.exam_mode,
+            Report.exam_group,
+            Report.description,
+            Report.impression,
+            Report.status,
+            Report.assigned_doctor_id,
+            Report.assigned_at,
+            Report.annotator_doctor_id,
+            Report.reviewer_doctor_id,
+            Report.review_assigned_at,
+            Report.reviewed_at,
+            Report.review_completed_user_ids,
+            Report.review_completed_at,
+            Report.submitted_at,
+            Report.pre_annotations,
+        ))
+        paged_rows = query.offset((page - 1) * page_size).limit(page_size).all()
 
-    annotation_by_report_id = {}
-    if paged_reports:
-        report_ids = [report.id for report in paged_reports]
-        if lite:
-            annotation_rows = db.query(
-                Annotation.report_id.label("report_id"),
-                Annotation.status.label("status"),
-                Annotation.submitted_at.label("submitted_at")
-            ).filter(
-                Annotation.report_id.in_(report_ids)
+    if paged_rows:
+        related_user_ids = {
+            user_id for user_id in [
+                *(row.reviewer_doctor_id for row in paged_rows),
+                *(
+                    completed_user_id
+                    for row in paged_rows
+                    for completed_user_id in _normalize_review_completed_user_ids(row.review_completed_user_ids)
+                )
+            ] if user_id
+        }
+        if related_user_ids:
+            user_rows = db.query(User).filter(
+                User.id.in_(related_user_ids),
+                User.is_cancel == False,
+                User.enabled == True
             ).all()
-            annotation_by_report_id = {
-                annotation.report_id: {
-                    "status": annotation.status,
-                    "submitted_at": annotation.submitted_at
-                }
-                for annotation in annotation_rows
-            }
-        else:
-            annotation_rows = db.query(Annotation).filter(Annotation.report_id.in_(report_ids)).all()
-            annotation_by_report_id = {annotation.report_id: annotation for annotation in annotation_rows}
+            user_by_id = {user.id: user for user in user_rows}
 
     paged_items = []
-    for report in paged_reports:
-        annotation = annotation_by_report_id.get(report.id)
-        annotation_status = annotation.get("status") if lite and annotation else annotation.status if annotation else None
-        annotation_submitted_at = annotation.get("submitted_at") if lite and annotation else annotation.submitted_at if annotation else None
+    annotation_by_report_id = {}
+    if not lite and paged_rows:
+        report_ids = [report.id for report in paged_rows]
+        annotation_rows = db.query(Annotation).filter(Annotation.report_id.in_(report_ids)).all()
+        annotation_by_report_id = {annotation.report_id: annotation for annotation in annotation_rows}
+
+    for report in paged_rows:
+        annotation = None if lite else annotation_by_report_id.get(report.id)
+        annotation_status = report.annotation_status if lite else annotation.status if annotation else None
+        annotation_submitted_at = report.annotation_submitted_at if lite else annotation.submitted_at if annotation else None
+        review_completed_user_ids = _normalize_review_completed_user_ids(report.review_completed_user_ids)
         paged_items.append(DoctorReportResponse(
             id=report.id,
             external_id=report.external_id,
@@ -630,9 +885,15 @@ def list_doctor_reports(
             reviewer_doctor_id=report.reviewer_doctor_id,
             review_assigned_at=report.review_assigned_at,
             reviewed_at=report.reviewed_at,
+            review_completed_at=report.review_completed_at,
+            review_completed_user_ids=review_completed_user_ids,
+            review_completed_users=_build_review_completed_users(report, user_by_id),
             submitted_at=report.submitted_at,
             annotation_status=annotation_status,
             annotation_submitted_at=annotation_submitted_at,
+            is_review_task=_is_review_task(report),
+            is_current_user_assigned_reviewer=bool(report.reviewer_doctor_id and report.reviewer_doctor_id == current_user.id),
+            has_current_user_completed_review=current_user.id in review_completed_user_ids,
             pre_annotations=None if lite else report.pre_annotations,
             annotation=None if lite else annotation
         ))
@@ -642,7 +903,9 @@ def list_doctor_reports(
         page=page,
         page_size=page_size,
         total=total,
-        progress=DoctorProgressResponse(done=progress_done or 0, total=progress_total or 0)
+        progress=annotation_progress,
+        annotation_progress=annotation_progress,
+        review_progress=review_progress
     )
 
 
@@ -661,18 +924,40 @@ def get_doctor_report(
             Report.id == report_id,
             Report.assigned_doctor_id == current_user.id,
             Report.is_cancel == False
-        ).first()
+    ).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
+
+    annotation = db.query(Annotation).filter(Annotation.report_id == report_id).first()
+    related_user_ids = {
+        user_id for user_id in [
+            report.reviewer_doctor_id,
+            *(_normalize_review_completed_user_ids(report.review_completed_user_ids))
+        ] if user_id
+    }
+    user_by_id = {}
+    if related_user_ids:
+        user_rows = db.query(User).filter(
+            User.id.in_(related_user_ids),
+            User.is_cancel == False,
+            User.enabled == True
+        ).all()
+        user_by_id = {user.id: user for user in user_rows}
 
     # 复核员打开待复核报告即进入“复核中”
     if report.status == STATUS_REVIEW_ASSIGNED and report.assigned_doctor_id == current_user.id:
         report.status = STATUS_REVIEW_IN_PROGRESS
         db.commit()
         db.refresh(report)
+        _schedule_report_updates_broadcast(
+            "review-started",
+            report_id,
+            status=report.status,
+            annotation_status=annotation.status if annotation else None,
+            review_completed_user_ids=_normalize_review_completed_user_ids(report.review_completed_user_ids)
+        )
 
-    annotation = db.query(Annotation).filter(Annotation.report_id == report_id).first()
-
+    review_completed_user_ids = _normalize_review_completed_user_ids(report.review_completed_user_ids)
     return DoctorReportResponse(
         id=report.id,
         external_id=report.external_id,
@@ -695,9 +980,15 @@ def get_doctor_report(
         reviewer_doctor_id=report.reviewer_doctor_id,
         review_assigned_at=report.review_assigned_at,
         reviewed_at=report.reviewed_at,
+        review_completed_at=report.review_completed_at,
+        review_completed_user_ids=review_completed_user_ids,
+        review_completed_users=_build_review_completed_users(report, user_by_id),
         submitted_at=report.submitted_at,
         annotation_status=annotation.status if annotation else None,
         annotation_submitted_at=annotation.submitted_at if annotation else None,
+        is_review_task=_is_review_task(report),
+        is_current_user_assigned_reviewer=bool(report.reviewer_doctor_id and report.reviewer_doctor_id == current_user.id),
+        has_current_user_completed_review=current_user.id in review_completed_user_ids,
         pre_annotations=report.pre_annotations,
         annotation=annotation
     )
@@ -765,6 +1056,55 @@ def collaboration_heartbeat(
         state = _build_collaboration_fallback_state(db, report_id, current_user, granted=granted, report=report)
         _schedule_collaboration_state_broadcast(report_id)
         return state
+
+
+@router.websocket("/reports/updates/ws")
+async def report_updates_websocket(websocket: WebSocket):
+    token = websocket.query_params.get("token") or websocket.headers.get("authorization")
+    db = SessionLocal()
+    current_user = None
+
+    try:
+        current_user = get_current_user_from_token_value(token, db)
+        if current_user.role not in {"doctor", "admin"}:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Insufficient permissions")
+            return
+    except HTTPException as exc:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=str(exc.detail))
+        return
+    finally:
+        db.close()
+
+    client = ReportUpdatesSocketClient(
+        websocket=websocket,
+        user_id=current_user.id,
+        username=current_user.username,
+        role=current_user.role
+    )
+    await report_updates_socket_hub.connect(client)
+
+    try:
+        await websocket.send_json({
+            "type": "reports-updated-connected",
+            "at": _utcnow().isoformat()
+        })
+        while True:
+            try:
+                payload_text = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                continue
+
+            if str(payload_text or "").strip().lower() == "ping":
+                await websocket.send_json({
+                    "type": "pong",
+                    "at": _utcnow().isoformat()
+                })
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await report_updates_socket_hub.disconnect(client)
 
 
 @router.websocket("/reports/{report_id}/collaboration/ws")
@@ -997,7 +1337,8 @@ def save_draft(
         annotation = Annotation(
             report_id=report_id,
             doctor_id=annotation_owner_id,
-            status="DRAFT"
+            status="DRAFT",
+            annotation_user_ids=[]
         )
         db.add(annotation)
 
@@ -1016,6 +1357,13 @@ def save_draft(
     db.commit()
     db.refresh(annotation)
     _schedule_collaboration_state_broadcast(report_id)
+    _schedule_report_updates_broadcast(
+        "draft-saved",
+        report_id,
+        status=report.status,
+        annotation_status=annotation.status,
+        review_completed_user_ids=_normalize_review_completed_user_ids(report.review_completed_user_ids)
+    )
 
     return SaveDraftResponse(ok=True, saved_at=now)
 
@@ -1074,7 +1422,8 @@ def submit_annotation(
         annotation_owner_id = report.annotator_doctor_id or report.assigned_doctor_id or current_user.id
         annotation = Annotation(
             report_id=report_id,
-            doctor_id=annotation_owner_id
+            doctor_id=annotation_owner_id,
+            annotation_user_ids=[]
         )
         db.add(annotation)
 
@@ -1082,11 +1431,15 @@ def submit_annotation(
     annotation.data = request.data.model_dump()
     annotation.status = "SUBMITTED"
     annotation.submitted_at = now
+    if not is_review_mode:
+        _append_annotation_user_id(annotation, current_user.id)
 
     # 更新报告状态
     if is_review_mode:
+        _append_review_completed_user_id(report, current_user.id)
         report.status = STATUS_DONE
         report.reviewed_at = now
+        report.review_completed_at = now
         if not report.reviewer_doctor_id:
             report.reviewer_doctor_id = current_user.id
     elif is_admin_imported_annotation:
@@ -1113,6 +1466,13 @@ def submit_annotation(
     if collaboration_supported:
         _best_effort_release_edit_lock(db, report_id, current_user)
     _schedule_collaboration_state_broadcast(report_id)
+    _schedule_report_updates_broadcast(
+        "submitted",
+        report_id,
+        status=report.status,
+        annotation_status=annotation.status,
+        review_completed_user_ids=_normalize_review_completed_user_ids(report.review_completed_user_ids)
+    )
 
     return SubmitResponse(
         ok=True,
@@ -1159,14 +1519,31 @@ def cancel_annotation(
         annotation.status = "DRAFT"
         annotation.submitted_at = None
 
+    is_review_workflow = _is_review_task(report)
+    review_completed_user_ids = _normalize_review_completed_user_ids(report.review_completed_user_ids)
+    if current_user.id in review_completed_user_ids:
+        report.review_completed_user_ids = [
+            user_id for user_id in review_completed_user_ids
+            if user_id != current_user.id
+        ]
+
     if report.status == STATUS_IMPORTED:
         report.submitted_at = None
-    elif report.status == STATUS_REVIEW_ASSIGNED:
-        report.status = STATUS_REVIEW_IN_PROGRESS
+    elif is_review_workflow:
+        report.status = STATUS_REVIEW_IN_PROGRESS if annotation else STATUS_REVIEW_ASSIGNED
         report.reviewed_at = None
+        if not _normalize_review_completed_user_ids(report.review_completed_user_ids):
+            report.review_completed_at = None
     else:
         report.status = STATUS_IN_PROGRESS if annotation else STATUS_ASSIGNED
         report.submitted_at = None
     db.commit()
     _schedule_collaboration_state_broadcast(report_id)
+    _schedule_report_updates_broadcast(
+        "canceled",
+        report_id,
+        status=report.status,
+        annotation_status=annotation.status if annotation else None,
+        review_completed_user_ids=_normalize_review_completed_user_ids(report.review_completed_user_ids)
+    )
     return {"ok": True}

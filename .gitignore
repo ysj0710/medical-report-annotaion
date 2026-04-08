@@ -5,3 +5,5 @@ __pycache__/
 backend/venv/
 node_modules/
 .DS_Store
+frontend/dist/
+backend/med_anno.db

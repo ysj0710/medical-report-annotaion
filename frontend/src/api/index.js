@@ -1,5 +1,6 @@
 const API_BASE = '/api'
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1'])
+const TOKEN_STORAGE_KEY = 'token'
 
 function buildWebSocketOriginFromTarget(target) {
   const raw = String(target || '').trim()
@@ -27,7 +28,54 @@ function normalizeToken(raw) {
   return value
 }
 
-let token = normalizeToken(localStorage.getItem('token'))
+function getSessionStorage() {
+  if (typeof window === 'undefined') return null
+  try {
+    return window.sessionStorage
+  } catch (_e) {
+    return null
+  }
+}
+
+function getLocalStorage() {
+  if (typeof window === 'undefined') return null
+  try {
+    return window.localStorage
+  } catch (_e) {
+    return null
+  }
+}
+
+function readStoredToken() {
+  const sessionStorageRef = getSessionStorage()
+  const localStorageRef = getLocalStorage()
+
+  const sessionToken = normalizeToken(sessionStorageRef?.getItem(TOKEN_STORAGE_KEY))
+  if (sessionToken) return sessionToken
+
+  const legacyLocalToken = normalizeToken(localStorageRef?.getItem(TOKEN_STORAGE_KEY))
+  if (legacyLocalToken && sessionStorageRef) {
+    sessionStorageRef.setItem(TOKEN_STORAGE_KEY, legacyLocalToken)
+    localStorageRef?.removeItem(TOKEN_STORAGE_KEY)
+  }
+  return legacyLocalToken
+}
+
+function persistToken(nextToken) {
+  const sessionStorageRef = getSessionStorage()
+  const localStorageRef = getLocalStorage()
+
+  if (nextToken) {
+    sessionStorageRef?.setItem(TOKEN_STORAGE_KEY, nextToken)
+  } else {
+    sessionStorageRef?.removeItem(TOKEN_STORAGE_KEY)
+  }
+
+  // 兼容旧版本：清掉共享 localStorage，避免多窗口串号。
+  localStorageRef?.removeItem(TOKEN_STORAGE_KEY)
+}
+
+let token = readStoredToken()
 let currentUser = null
 let currentUserRequest = null
 
@@ -39,15 +87,11 @@ function setCurrentUser(user) {
 export const api = {
   setToken(t) {
     token = normalizeToken(t)
-    if (token) {
-      localStorage.setItem('token', token)
-    } else {
-      localStorage.removeItem('token')
-    }
+    persistToken(token)
   },
   clearToken() {
     token = null
-    localStorage.removeItem('token')
+    persistToken(null)
     currentUser = null
     currentUserRequest = null
   },
@@ -96,6 +140,46 @@ export const api = {
   },
   buildCollaborationWebSocketUrl(reportId) {
     return this.buildCollaborationWebSocketUrls(reportId)[0] || ''
+  },
+  buildReportUpdatesWebSocketUrls() {
+    const authToken = normalizeToken(token)
+    if (!authToken || typeof window === 'undefined') return []
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const encodedToken = encodeURIComponent(authToken)
+    const path = `${API_BASE}/doctor/reports/updates/ws?token=${encodedToken}`
+    const urls = []
+    const hostname = window.location.hostname
+    const port = window.location.port
+    const isBareLocalhost = LOCAL_HOSTS.has(hostname) && (!port || port === '80' || port === '443')
+
+    if (!isBareLocalhost) {
+      pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
+    }
+
+    const envTarget = buildWebSocketOriginFromTarget(
+      import.meta.env.VITE_COLLABORATION_WS_TARGET ||
+      import.meta.env.VITE_API_PROXY_TARGET
+    )
+    if (envTarget) {
+      pushUniqueUrl(urls, `${envTarget}${path}`)
+    }
+
+    if (LOCAL_HOSTS.has(hostname)) {
+      pushUniqueUrl(urls, `${protocol}//127.0.0.1:8088${path}`)
+      pushUniqueUrl(urls, `${protocol}//localhost:8088${path}`)
+    } else if (!window.location.port || window.location.port === '80' || window.location.port === '443') {
+      pushUniqueUrl(urls, `${protocol}//${hostname}:8088${path}`)
+    }
+
+    if (isBareLocalhost) {
+      pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
+    }
+
+    return urls
+  },
+  buildReportUpdatesWebSocketUrl() {
+    return this.buildReportUpdatesWebSocketUrls()[0] || ''
   },
 
   async request(method, path, data = null) {

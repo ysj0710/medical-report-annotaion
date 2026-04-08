@@ -5,12 +5,14 @@ import re
 import zipfile
 from typing import Optional, List
 from datetime import datetime
+from anyio import from_thread
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
 import pandas as pd
 from io import BytesIO
 from ...core.database import get_db
+from ...core.collaboration_ws import report_updates_socket_hub
 from ...models.user import User
 from ...models.report import Report
 from ...models.import_task import ImportTask
@@ -39,6 +41,149 @@ TASK_PENDING = "PENDING"
 TASK_RUNNING = "RUNNING"
 TASK_SUCCESS = "SUCCESS"
 TASK_FAILED = "FAILED"
+REVIEW_ACTIVE_STATUSES = {STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS}
+
+
+def _normalize_annotation_user_ids(raw_value) -> List[int]:
+    if not isinstance(raw_value, list):
+        return []
+
+    normalized_ids: List[int] = []
+    seen_ids = set()
+    for item in raw_value:
+        try:
+            user_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0 or user_id in seen_ids:
+            continue
+        seen_ids.add(user_id)
+        normalized_ids.append(user_id)
+    return normalized_ids
+
+
+def _append_unique_username(usernames: List[str], username: Optional[str]) -> None:
+    value = str(username or "").strip()
+    if not value or value in usernames:
+        return
+    usernames.append(value)
+
+
+def _normalize_review_completed_user_ids(raw_value) -> List[int]:
+    return _normalize_annotation_user_ids(raw_value)
+
+
+def _build_review_user_payload(user: Optional[User]) -> Optional[dict]:
+    if not user:
+        return None
+    return {
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "employee_id": user.employee_id
+    }
+
+
+def _is_review_task(report: Report) -> bool:
+    return bool(
+        report.status in REVIEW_ACTIVE_STATUSES
+        or report.reviewer_doctor_id
+        or report.review_assigned_at
+        or _normalize_review_completed_user_ids(report.review_completed_user_ids)
+    )
+
+
+def _build_review_completed_users(report: Report, user_by_id: dict[int, User]) -> List[dict]:
+    results: List[dict] = []
+    for user_id in _normalize_review_completed_user_ids(report.review_completed_user_ids):
+        payload = _build_review_user_payload(user_by_id.get(user_id))
+        if payload:
+            results.append(payload)
+    return results
+
+
+def _build_reviewer_display(report: Report, user_by_id: dict[int, User]) -> tuple[Optional[str], Optional[str], List[dict]]:
+    reviewer_users: List[dict] = []
+    seen_ids: set[int] = set()
+
+    def append_user(user_id: Optional[int]) -> None:
+        if not user_id or user_id in seen_ids:
+            return
+        payload = _build_review_user_payload(user_by_id.get(user_id))
+        if not payload:
+            return
+        seen_ids.add(user_id)
+        reviewer_users.append(payload)
+
+    append_user(report.reviewer_doctor_id)
+    for user_id in _normalize_review_completed_user_ids(report.review_completed_user_ids):
+        append_user(user_id)
+
+    if not reviewer_users:
+        return None, None, []
+
+    employee_id = reviewer_users[0].get("employee_id") if len(reviewer_users) == 1 else None
+    username = "、".join(str(item.get("username") or "") for item in reviewer_users if item.get("username"))
+    return employee_id, username or None, reviewer_users
+
+
+def _build_annotator_display(
+    annotation: Optional[Annotation],
+    assigned_doctor: Optional[User],
+    user_by_id: dict[int, User],
+    admin_collaboration_users: Optional[List[dict]] = None
+) -> tuple[Optional[str], Optional[str]]:
+    annotator_names: List[str] = []
+
+    for user_id in _normalize_annotation_user_ids(annotation.annotation_user_ids if annotation else None):
+        user = user_by_id.get(user_id)
+        _append_unique_username(annotator_names, user.username if user else None)
+
+    for entry in admin_collaboration_users or []:
+        _append_unique_username(annotator_names, entry.get("username"))
+
+    _append_unique_username(annotator_names, assigned_doctor.username if assigned_doctor else None)
+
+    if not annotator_names:
+        return None, None
+
+    employee_id = assigned_doctor.employee_id if assigned_doctor and len(annotator_names) == 1 and annotator_names[0] == assigned_doctor.username else None
+    return employee_id, "、".join(annotator_names)
+
+
+async def _broadcast_report_updates_event(event_payload: dict) -> None:
+    clients = await report_updates_socket_hub.get_clients()
+    if not clients:
+        return
+
+    for client in clients:
+        try:
+            await client.websocket.send_json(event_payload)
+        except Exception:
+            await report_updates_socket_hub.disconnect(client)
+
+
+def _schedule_report_updates_broadcast(
+    event: str,
+    report_id: Optional[int] = None,
+    *,
+    status: Optional[str] = None,
+    annotation_status: Optional[str] = None,
+    review_completed_user_ids: Optional[List[int]] = None
+) -> None:
+    payload = {
+        "type": "reports-updated",
+        "event": event,
+        "report_id": report_id,
+        "status": status,
+        "annotation_status": annotation_status,
+        "review_completed_user_ids": review_completed_user_ids,
+        "at": datetime.utcnow().isoformat()
+    }
+    try:
+        from_thread.run(_broadcast_report_updates_event, payload)
+    except Exception as exc:
+        print(f"Report updates websocket broadcast skipped for report {report_id}: {exc}")
 
 
 # 表头映射 - 支持英文和中文
@@ -572,7 +717,17 @@ def list_reports(
         related_user_ids = {
             user_id for user_id in [
                 *(item.assigned_doctor_id for item in items),
-                *(item.reviewer_doctor_id for item in items)
+                *(item.reviewer_doctor_id for item in items),
+                *(
+                    completed_user_id
+                    for item in items
+                    for completed_user_id in _normalize_review_completed_user_ids(item.review_completed_user_ids)
+                ),
+                *(
+                    user_id
+                    for annotation in annotation_rows
+                    for user_id in _normalize_annotation_user_ids(annotation.annotation_user_ids)
+                )
             ] if user_id
         }
         if related_user_ids:
@@ -613,7 +768,6 @@ def list_reports(
         annotation = annotation_by_report_id.get(item.id)
         annotator_id = item.annotator_doctor_id or (annotation.doctor_id if annotation else None)
         admin_collaboration_users = admin_collaboration_users_by_report_id.get(item.id, [])
-        collaborator_names = [entry["username"] for entry in admin_collaboration_users if entry.get("username")]
         item_dict = {
             'id': item.id,
             'external_id': item.external_id,
@@ -628,6 +782,9 @@ def list_reports(
             'reviewer_doctor_id': item.reviewer_doctor_id,
             'review_assigned_at': item.review_assigned_at,
             'reviewed_at': item.reviewed_at,
+            'review_completed_at': item.review_completed_at,
+            'review_completed_user_ids': _normalize_review_completed_user_ids(item.review_completed_user_ids),
+            'review_completed_users': [],
             'submitted_at': item.submitted_at,
             'modality': item.modality,
             'patient_name': item.patient_name,
@@ -646,22 +803,21 @@ def list_reports(
             'annotation_data': annotation.data if annotation else None,
             'annotation_status': annotation.status if annotation else None,
             'annotation_submitted_at': annotation.submitted_at if annotation else None,
+            'is_review_task': _is_review_task(item),
         }
         assigned_doctor = user_by_id.get(item.assigned_doctor_id)
-        if assigned_doctor:
-            item_dict['doctor_employee_id'] = assigned_doctor.employee_id
-            item_dict['doctor_username'] = assigned_doctor.username
-            if assigned_doctor.username and assigned_doctor.username not in collaborator_names:
-                collaborator_names.append(assigned_doctor.username)
-        if collaborator_names:
-            item_dict['doctor_username'] = "、".join(collaborator_names)
-            if len(collaborator_names) > 1:
-                item_dict['doctor_employee_id'] = None
-        if item.reviewer_doctor_id:
-            reviewer = user_by_id.get(item.reviewer_doctor_id)
-            if reviewer:
-                item_dict['reviewer_employee_id'] = reviewer.employee_id
-                item_dict['reviewer_username'] = reviewer.username
+        doctor_employee_id, doctor_username = _build_annotator_display(
+            annotation,
+            assigned_doctor,
+            user_by_id,
+            admin_collaboration_users
+        )
+        item_dict['doctor_employee_id'] = doctor_employee_id
+        item_dict['doctor_username'] = doctor_username
+        reviewer_employee_id, reviewer_username, review_completed_users = _build_reviewer_display(item, user_by_id)
+        item_dict['reviewer_employee_id'] = reviewer_employee_id
+        item_dict['reviewer_username'] = reviewer_username
+        item_dict['review_completed_users'] = review_completed_users
         result_items.append(item_dict)
 
     return ReportListResponse(
@@ -702,6 +858,7 @@ def batch_delete_reports(
         Report.is_cancel == False
     ).update({Report.is_cancel: True}, synchronize_session=False)
     db.commit()
+    _schedule_report_updates_broadcast("batch-deleted")
     return {"ok": True, "deleted": deleted}
 
 
@@ -716,12 +873,53 @@ def get_report(
         raise HTTPException(status_code=404, detail="Report not found")
     annotation = db.query(Annotation).filter(Annotation.report_id == report.id).first()
     annotator_id = report.annotator_doctor_id or (annotation.doctor_id if annotation else None)
-    doctor = None
-    reviewer = None
-    if annotator_id:
-        doctor = db.query(User).filter(User.id == annotator_id, User.is_cancel == False).first()
-    if report.reviewer_doctor_id:
-        reviewer = db.query(User).filter(User.id == report.reviewer_doctor_id, User.is_cancel == False).first()
+    related_user_ids = {
+        user_id for user_id in [
+            report.assigned_doctor_id,
+            report.reviewer_doctor_id,
+            *(_normalize_review_completed_user_ids(report.review_completed_user_ids)),
+            annotator_id,
+            *(_normalize_annotation_user_ids(annotation.annotation_user_ids) if annotation else [])
+        ] if user_id
+    }
+    user_by_id = {}
+    if related_user_ids:
+        user_rows = db.query(User).filter(
+            User.id.in_(related_user_ids),
+            User.is_cancel == False,
+            User.enabled == True
+        ).all()
+        user_by_id = {user.id: user for user in user_rows}
+
+    admin_collaboration_users: List[dict] = []
+    collaboration_rows = db.query(
+        User.id,
+        User.username
+    ).join(
+        ReportCollaborationSession, User.id == ReportCollaborationSession.user_id
+    ).filter(
+        ReportCollaborationSession.report_id == report.id,
+        User.is_cancel == False,
+        User.enabled == True,
+        User.role == "admin"
+    ).order_by(
+        ReportCollaborationSession.last_activity_at.desc().nullslast(),
+        ReportCollaborationSession.last_seen_at.desc(),
+        User.id.asc()
+    ).all()
+    for user_id, username in collaboration_rows:
+        if any(entry["id"] == user_id for entry in admin_collaboration_users):
+            continue
+        admin_collaboration_users.append({"id": user_id, "username": username})
+
+    assigned_doctor = user_by_id.get(report.assigned_doctor_id)
+    doctor_employee_id, doctor_username = _build_annotator_display(
+        annotation,
+        assigned_doctor,
+        user_by_id,
+        admin_collaboration_users
+    )
+    reviewer_employee_id, reviewer_username, review_completed_users = _build_reviewer_display(report, user_by_id)
 
     return {
         "id": report.id,
@@ -737,6 +935,9 @@ def get_report(
         "reviewer_doctor_id": report.reviewer_doctor_id,
         "review_assigned_at": report.review_assigned_at,
         "reviewed_at": report.reviewed_at,
+        "review_completed_at": report.review_completed_at,
+        "review_completed_user_ids": _normalize_review_completed_user_ids(report.review_completed_user_ids),
+        "review_completed_users": review_completed_users,
         "submitted_at": report.submitted_at,
         "modality": report.modality,
         "patient_name": report.patient_name,
@@ -748,13 +949,14 @@ def get_report(
         "description": report.description,
         "impression": report.impression,
         "pre_annotations": report.pre_annotations,
-        "doctor_employee_id": doctor.employee_id if doctor else None,
-        "doctor_username": doctor.username if doctor else None,
-        "reviewer_employee_id": reviewer.employee_id if reviewer else None,
-        "reviewer_username": reviewer.username if reviewer else None,
+        "doctor_employee_id": doctor_employee_id,
+        "doctor_username": doctor_username,
+        "reviewer_employee_id": reviewer_employee_id,
+        "reviewer_username": reviewer_username,
         "annotation_data": annotation.data if annotation else None,
         "annotation_status": annotation.status if annotation else None,
         "annotation_submitted_at": annotation.submitted_at if annotation else None,
+        "is_review_task": _is_review_task(report),
     }
 
 
@@ -770,6 +972,7 @@ def delete_report(
         raise HTTPException(status_code=404, detail="Report not found")
     report.is_cancel = True
     db.commit()
+    _schedule_report_updates_broadcast("deleted", report_id)
     return {"ok": True}
 
 
@@ -969,6 +1172,11 @@ def assign_reports(
             report.reviewer_doctor_id = None
             report.review_assigned_at = None
             report.reviewed_at = None
+            report.review_completed_at = None
+            report.review_completed_user_ids = []
+            annotation = db.query(Annotation).filter(Annotation.report_id == report.id).first()
+            if annotation:
+                annotation.annotation_user_ids = []
             per_doctor[str(doctor_id)] += 1
     else:
         start_idx = 0
@@ -994,6 +1202,8 @@ def assign_reports(
             report.reviewer_doctor_id = chosen_doctor_id
             report.review_assigned_at = now
             report.reviewed_at = None
+            report.review_completed_at = None
+            report.review_completed_user_ids = []
             report.assigned_doctor_id = chosen_doctor_id
             report.assigned_at = now
             report.status = STATUS_REVIEW_ASSIGNED
@@ -1019,6 +1229,10 @@ def assign_reports(
                 detail=f"分配数量异常：期望 {expected_total} 条，实际 {assigned_total} 条，已回滚"
             )
     db.commit()
+    _schedule_report_updates_broadcast(
+        "assigned",
+        status=STATUS_REVIEW_ASSIGNED if selected_mode == "review" else STATUS_ASSIGNED
+    )
     return AssignResponse(assigned=assigned_total, per_doctor=per_doctor, mode=selected_mode)
 
 

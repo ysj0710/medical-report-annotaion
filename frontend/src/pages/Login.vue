@@ -5,11 +5,11 @@
       <form @submit.prevent="handleLogin">
         <div class="form-group">
           <label>用户名</label>
-          <input v-model="username" type="text" required />
+          <input v-model="username" type="text" autocomplete="username" required />
         </div>
         <div class="form-group">
           <label>密码</label>
-          <input v-model="password" type="password" required />
+          <input v-model="password" type="password" autocomplete="current-password" required />
         </div>
         <div v-if="error" class="error">{{ error }}</div>
         <button type="submit" :disabled="loading">
