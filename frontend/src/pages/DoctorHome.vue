@@ -107,7 +107,7 @@
           <el-button @click="goNextReport">下一个</el-button>
           <el-button type="primary" @click="createManualCardFromSelection" :disabled="isEditingLocked">标注选中文本</el-button>
           <el-button type="success" @click="submitReport" :loading="submitting" :disabled="!canSubmitCurrentReport">{{ submitButtonText }}</el-button>
-          <el-button v-if="showCancelAnnotationButton" type="danger" plain @click="cancelSubmittedAnnotation" :disabled="isCollaborationEditingLocked">取消标注</el-button>
+          <el-button v-if="showCancelAnnotationButton" type="danger" plain @click="cancelSubmittedAnnotation" :disabled="isCollaborationEditingLocked">{{ cancelAnnotationButtonText }}</el-button>
         </div>
       </div>
 
@@ -687,12 +687,18 @@ const showCancelAnnotationButton = computed(() => {
   if (isViewOnlyAccessibleReport.value) return false
   if (requiresDistributionBeforeAnnotation.value) return false
   const status = currentDisplayStatus.value
+  if (isReviewTask(currentReport.value)) {
+    return status === 'DONE'
+  }
   const annotationStatus = getAnnotationStatus(currentReport.value)
   if (annotationStatus === 'SUBMITTED') return true
-  if (isReviewTask(currentReport.value)) {
-    return ['REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS', 'DONE'].includes(status)
-  }
   return ['SUBMITTED', 'DONE'].includes(status)
+})
+const cancelAnnotationButtonText = computed(() => {
+  if (isReviewTask(currentReport.value) && currentDisplayStatus.value === 'DONE') {
+    return '撤销复核'
+  }
+  return '取消标注'
 })
 const submitButtonText = computed(() => {
   if (isReviewTask(currentReport.value)) {
@@ -3504,24 +3510,25 @@ const submitReport = async () => {
 
 const cancelSubmittedAnnotation = async () => {
   if (!currentReport.value || !showCancelAnnotationButton.value) return
-  const hasAccess = await ensureEditAccess('取消标注')
+  const reportIsReviewTask = isReviewTask(currentReport.value)
+  const actionText = reportIsReviewTask ? '撤销复核' : '取消标注'
+  const hasAccess = await ensureEditAccess(actionText)
   if (!hasAccess) return
   const reportId = currentReport.value.id
   const previousFilter = activeFilter.value
-  const reportIsReviewTask = isReviewTask(currentReport.value)
   const confirmText = reportIsReviewTask
-    ? '确认后将进入复核修改状态，是否继续？'
+    ? '撤销后，当前报告将回到待复核状态，是否继续？'
     : '取消后，当前报告将回到待标注状态，是否继续？'
-  const titleText = reportIsReviewTask ? '开始复核修改' : '取消标注确认'
+  const titleText = reportIsReviewTask ? '撤销复核确认' : '取消标注确认'
   const successText = reportIsReviewTask
-    ? '已进入复核修改状态，请完成核验后提交'
+    ? '已撤销复核，当前报告已回到待复核状态'
     : '已取消标注，当前报告已恢复为可编辑状态'
   try {
     await ElMessageBox.confirm(
       confirmText,
       titleText,
       {
-        confirmButtonText: '确认取消',
+        confirmButtonText: reportIsReviewTask ? '确认撤销' : '确认取消',
         cancelButtonText: '返回',
         type: 'warning'
       }
