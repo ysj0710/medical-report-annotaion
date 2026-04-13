@@ -129,7 +129,7 @@ def _build_reviewer_display(report: Report, user_by_id: dict[int, User]) -> tupl
 
 def _build_annotator_display(
     annotation: Optional[Annotation],
-    assigned_doctor: Optional[User],
+    annotator_user: Optional[User],
     user_by_id: dict[int, User],
     admin_collaboration_users: Optional[List[dict]] = None
 ) -> tuple[Optional[str], Optional[str]]:
@@ -142,12 +142,16 @@ def _build_annotator_display(
     for entry in admin_collaboration_users or []:
         _append_unique_username(annotator_names, entry.get("username"))
 
-    _append_unique_username(annotator_names, assigned_doctor.username if assigned_doctor else None)
+    _append_unique_username(annotator_names, annotator_user.username if annotator_user else None)
 
     if not annotator_names:
         return None, None
 
-    employee_id = assigned_doctor.employee_id if assigned_doctor and len(annotator_names) == 1 and annotator_names[0] == assigned_doctor.username else None
+    employee_id = (
+        annotator_user.employee_id
+        if annotator_user and len(annotator_names) == 1 and annotator_names[0] == annotator_user.username
+        else None
+    )
     return employee_id, "、".join(annotator_names)
 
 
@@ -717,6 +721,7 @@ def list_reports(
         related_user_ids = {
             user_id for user_id in [
                 *(item.assigned_doctor_id for item in items),
+                *(item.annotator_doctor_id for item in items),
                 *(item.reviewer_doctor_id for item in items),
                 *(
                     completed_user_id
@@ -805,10 +810,10 @@ def list_reports(
             'annotation_submitted_at': annotation.submitted_at if annotation else None,
             'is_review_task': _is_review_task(item),
         }
-        assigned_doctor = user_by_id.get(item.assigned_doctor_id)
+        annotator_user = user_by_id.get(annotator_id)
         doctor_employee_id, doctor_username = _build_annotator_display(
             annotation,
-            assigned_doctor,
+            annotator_user,
             user_by_id,
             admin_collaboration_users
         )
@@ -912,10 +917,10 @@ def get_report(
             continue
         admin_collaboration_users.append({"id": user_id, "username": username})
 
-    assigned_doctor = user_by_id.get(report.assigned_doctor_id)
+    annotator_user = user_by_id.get(annotator_id)
     doctor_employee_id, doctor_username = _build_annotator_display(
         annotation,
-        assigned_doctor,
+        annotator_user,
         user_by_id,
         admin_collaboration_users
     )

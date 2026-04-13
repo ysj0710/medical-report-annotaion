@@ -115,6 +115,20 @@ def _is_review_done(source) -> bool:
     )
 
 
+def _annotation_owner_condition(current_user_id: int):
+    return or_(
+        Report.annotator_doctor_id == current_user_id,
+        and_(
+            Report.reviewer_doctor_id.is_(None),
+            Report.assigned_doctor_id == current_user_id
+        )
+    )
+
+
+def _review_owner_condition(current_user_id: int):
+    return Report.reviewer_doctor_id == current_user_id
+
+
 def _build_review_user_payload(user: Optional[User]) -> Optional[dict]:
     if not user:
         return None
@@ -150,9 +164,14 @@ def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
 def _get_accessible_report(db: Session, report_id: int, current_user: User) -> Optional[Report]:
     if current_user.role == "admin" or current_user.can_view_all:
         return db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
+    ownership_condition = or_(
+        Report.assigned_doctor_id == current_user.id,
+        Report.annotator_doctor_id == current_user.id,
+        Report.reviewer_doctor_id == current_user.id
+    )
     return db.query(Report).filter(
         Report.id == report_id,
-        Report.assigned_doctor_id == current_user.id,
+        ownership_condition,
         Report.is_cancel == False
     ).first()
 
@@ -682,9 +701,14 @@ def list_doctor_reports(
         # 可以查看所有报告
         query = db.query(Report).filter(Report.is_cancel == False)
     else:
+        ownership_condition = or_(
+            Report.assigned_doctor_id == current_user.id,
+            Report.annotator_doctor_id == current_user.id,
+            Report.reviewer_doctor_id == current_user.id
+        )
         # 只能查看分配给自己的报告
         query = db.query(Report).filter(
-            Report.assigned_doctor_id == current_user.id,
+            ownership_condition,
             Report.is_cancel == False
         )
 
@@ -712,18 +736,15 @@ def list_doctor_reports(
         )
     )
     annotation_done_condition = or_(
-        and_(
-            Report.status == STATUS_SUBMITTED,
-            Report.reviewer_doctor_id.is_(None)
-        ),
-        and_(
-            Annotation.status == "SUBMITTED",
-            Report.reviewer_doctor_id.is_(None),
-            Report.status.notin_(list(REVIEW_ACTIVE_STATUSES) + [STATUS_DONE])
-        )
+        Report.status.in_([STATUS_SUBMITTED, STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS, STATUS_DONE]),
+        Annotation.status == "SUBMITTED"
     )
 
-    annotation_total_condition = ~review_task_condition
+    annotation_total_condition = or_(
+        Report.assigned_doctor_id.is_not(None),
+        Report.annotator_doctor_id.is_not(None),
+        Annotation.id.is_not(None)
+    )
 
     annotation_total, annotation_done_total, review_total, review_done_total = base_query.outerjoin(
         Annotation, Annotation.report_id == Report.id
@@ -743,21 +764,29 @@ def list_doctor_reports(
         total=review_total or 0
     )
 
+    annotation_owner_condition = _annotation_owner_condition(current_user.id)
+    review_owner_condition = _review_owner_condition(current_user.id)
+
     # 按 tab 筛选状态
     if tab == "unannotated":
         query = query.filter(
+            annotation_owner_condition,
             Report.status.in_([STATUS_IMPORTED, STATUS_ASSIGNED, STATUS_IN_PROGRESS]),
             Report.reviewer_doctor_id.is_(None)
         )
     elif tab == "annotated":
         query = query.filter(
+            annotation_owner_condition,
             or_(
-                Report.status == STATUS_DONE,
-                and_(Report.status == STATUS_SUBMITTED, Report.reviewer_doctor_id.is_(None))
+                Report.status.in_([STATUS_SUBMITTED, STATUS_REVIEW_ASSIGNED, STATUS_REVIEW_IN_PROGRESS, STATUS_DONE]),
+                Annotation.status == "SUBMITTED"
             )
         )
     elif tab == "review":
-        query = query.filter(Report.status.in_(list(REVIEW_ACTIVE_STATUSES)))
+        query = query.filter(
+            review_owner_condition,
+            Report.status.in_(list(REVIEW_ACTIVE_STATUSES))
+        )
     elif tab == "no_error":
         query = query.join(Annotation, Annotation.report_id == Report.id).filter(
             Report.status.in_([STATUS_SUBMITTED, STATUS_DONE]),
@@ -920,9 +949,14 @@ def get_doctor_report(
     if current_user.role == "admin" or current_user.can_view_all:
         report = db.query(Report).filter(Report.id == report_id, Report.is_cancel == False).first()
     else:
+        ownership_condition = or_(
+            Report.assigned_doctor_id == current_user.id,
+            Report.annotator_doctor_id == current_user.id,
+            Report.reviewer_doctor_id == current_user.id
+        )
         report = db.query(Report).filter(
             Report.id == report_id,
-            Report.assigned_doctor_id == current_user.id,
+            ownership_condition,
             Report.is_cancel == False
     ).first()
     if not report:
@@ -1514,12 +1548,20 @@ def cancel_annotation(
         raise HTTPException(status_code=409, detail=_build_lock_conflict_message(db, report_id, current_user))
 
     annotation = db.query(Annotation).filter(Annotation.report_id == report_id).first()
+    is_review_workflow = _is_review_task(report)
+
+    if is_review_workflow:
+        is_current_review_user = bool(
+            report.reviewer_doctor_id == current_user.id
+            or current_user.id in _normalize_review_completed_user_ids(report.review_completed_user_ids)
+        )
+        if not is_current_review_user:
+            raise HTTPException(status_code=400, detail="该报告已被二次分发复核，无法取消标注")
 
     if annotation:
         annotation.status = "DRAFT"
         annotation.submitted_at = None
 
-    is_review_workflow = _is_review_task(report)
     review_completed_user_ids = _normalize_review_completed_user_ids(report.review_completed_user_ids)
     if current_user.id in review_completed_user_ids:
         report.review_completed_user_ids = [

@@ -203,19 +203,49 @@ const inferActionByAnno = (anno) => {
   return 'prompt'
 }
 
+const extractReplacementFromSuggestion = (message) => {
+  const text = String(message ?? '').trim()
+  if (!text) return ''
+  const patterns = [
+    /改成[“"]([^”"]+)[”"]/,
+    /替换(?:为|成)[“"]([^”"]+)[”"]/,
+    /替换成[“"]([^”"]+)[”"]/,
+    /替换为[“"]([^”"]+)[”"]/
+  ]
+  for (const pattern of patterns) {
+    const matched = text.match(pattern)
+    if (matched?.[1]) return matched[1].trim()
+  }
+  const quoted = text.match(/[“"]([^”"]+)[”"]/g)
+  if (quoted?.length) {
+    const last = quoted[quoted.length - 1]
+    return last.replace(/[“”"]/g, '').trim()
+  }
+  return ''
+}
+
+const getAnnotationReplacementText = (anno) => {
+  const targetText = String(anno?.target || '').trim()
+  if (targetText) return targetText
+  return extractReplacementFromSuggestion(anno?.alert_message || anno?.alert_msg || '')
+}
+
 const resolveHighlightRange = (text, anno) => {
   const source = String(anno.source || '')
   const parsedStart = Number.parseInt(anno.source_in_start, 10)
   const parsedEnd = Number.parseInt(anno.source_in_end, 10)
+  const hasExplicitStart = Number.isInteger(parsedStart)
+  const hasExplicitEnd = Number.isInteger(parsedEnd)
+  const hasExplicitRange = hasExplicitStart || hasExplicitEnd
 
-  if ((Number.isInteger(parsedStart) && parsedStart < 0) || (Number.isInteger(parsedEnd) && parsedEnd < 0)) {
+  if ((hasExplicitStart && parsedStart < 0) || (hasExplicitEnd && parsedEnd < 0)) {
     return { start: 0, end: 0, missing: true }
   }
 
   const candidates = []
 
-  if (Number.isInteger(parsedStart)) {
-    if (Number.isInteger(parsedEnd)) {
+  if (hasExplicitStart) {
+    if (hasExplicitEnd) {
       candidates.push([parsedStart, parsedEnd], [parsedStart - 1, parsedEnd - 1])
     }
     if (source) {
@@ -235,6 +265,10 @@ const resolveHighlightRange = (text, anno) => {
     if (text.slice(start, end) === source) {
       return { start, end, missing: false }
     }
+  }
+
+  if (hasExplicitRange) {
+    return null
   }
 
   if (source) {
@@ -294,7 +328,14 @@ const getHighlightedText = (field) => {
         ? 'prompt'
         : 'replace'
     const promptMark = actionClass === 'prompt' ? '<span class="error-corner">!</span>' : ''
-    const replaceHtml = `<span class="error-highlight ${actionClass}" title="错误类型: ${errType}\n建议说明: ${escapeHtml(alertMsg)}">${escapeHtml(sourceText)}${promptMark}</span>`
+    const replacementText = actionClass === 'replace' ? getAnnotationReplacementText(anno) : ''
+    const sourceHtml = actionClass === 'replace'
+      ? `<span class="error-source-strike">${escapeHtml(sourceText)}</span>`
+      : escapeHtml(sourceText)
+    const replaceSuffix = actionClass === 'replace' && replacementText
+      ? `<span class="error-replace-target">[${escapeHtml(replacementText)}]</span>`
+      : ''
+    const replaceHtml = `<span class="error-highlight ${actionClass}" title="错误类型: ${errType}\n建议说明: ${escapeHtml(alertMsg)}">${sourceHtml}${replaceSuffix}${promptMark}</span>`
 
     if (start >= 0 && start < text.length) {
       text = text.substring(0, start) + replaceHtml + text.substring(end)
@@ -480,16 +521,31 @@ const escapeHtml = (text) => {
   text-decoration: line-through;
 }
 
-:deep(.error-highlight.prompt) {
+:deep(.error-highlight.replace) {
   background-color: #fee2e2;
   color: #991b1b;
-  border: 1px dashed #ef4444;
+  border: 1px solid #ef4444;
+}
+
+:deep(.error-highlight.prompt) {
+  background-color: #dbeafe;
+  color: #1e40af;
+  border: 1px solid #60a5fa;
 }
 
 :deep(.error-highlight.missing) {
   background-color: #fff7ed;
   color: #b45309;
   border: 1px dashed #f59e0b;
+}
+
+:deep(.error-source-strike) {
+  text-decoration: line-through;
+}
+
+:deep(.error-replace-target) {
+  color: #dc2626;
+  font-weight: 700;
 }
 
 :deep(.error-corner) {
@@ -502,7 +558,7 @@ const escapeHtml = (text) => {
   border-radius: 999px;
   text-align: center;
   color: #fff;
-  background: #ef4444;
+  background: #2563eb;
   font-size: 10px;
 }
 </style>

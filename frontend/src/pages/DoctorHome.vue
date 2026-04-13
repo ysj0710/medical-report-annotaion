@@ -107,7 +107,16 @@
           <el-button @click="goNextReport">下一个</el-button>
           <el-button type="primary" @click="createManualCardFromSelection" :disabled="isEditingLocked">标注选中文本</el-button>
           <el-button type="success" @click="submitReport" :loading="submitting" :disabled="!canSubmitCurrentReport">{{ submitButtonText }}</el-button>
-          <el-button v-if="showCancelAnnotationButton" type="danger" plain @click="cancelSubmittedAnnotation" :disabled="isCollaborationEditingLocked">{{ cancelAnnotationButtonText }}</el-button>
+          <el-button
+            v-if="showCancelAnnotationButton"
+            type="danger"
+            plain
+            @click="handleCancelAnnotationAction"
+            :disabled="isCancelAnnotationActionDisabled"
+            :class="{ 'cancel-annotation-btn-blocked': isCancelAnnotationBlockedByReview }"
+          >
+            {{ cancelAnnotationButtonText }}
+          </el-button>
         </div>
       </div>
 
@@ -524,39 +533,83 @@ const isReviewTask = (reportLike) => !!(
 )
 const isAssignedReviewer = (reportLike) => !!reportLike?.is_current_user_assigned_reviewer
 const hasCurrentUserCompletedReview = (reportLike) => !!reportLike?.has_current_user_completed_review
+const isCurrentUserAnnotator = (reportLike) => {
+  const currentUserId = currentUser.value?.id
+  if (!currentUserId) return false
+  return (
+    reportLike?.annotator_doctor_id === currentUserId ||
+    (
+      !isReviewTask(reportLike) &&
+      reportLike?.assigned_doctor_id === currentUserId
+    )
+  )
+}
+const isCurrentUserReviewOwner = (reportLike) => isAssignedReviewer(reportLike) || hasCurrentUserCompletedReview(reportLike)
+const isInAnnotationTaskPool = (reportLike) => {
+  if (props.isAdminMode) {
+    return (
+      !isReviewTask(reportLike) ||
+      !!reportLike?.annotator_doctor_id ||
+      getAnnotationStatus(reportLike) === 'SUBMITTED'
+    )
+  }
+  return isCurrentUserAnnotator(reportLike)
+}
+const isInReviewTaskPool = (reportLike) => {
+  if (props.isAdminMode) return isReviewTask(reportLike)
+  return isCurrentUserReviewOwner(reportLike)
+}
+const isCurrentUserTaskOwner = (reportLike) => isCurrentUserAnnotator(reportLike) || isCurrentUserReviewOwner(reportLike)
 const isAdminImportedReport = (reportLike) => props.isAdminMode && resolveBaseStatus(reportLike) === 'IMPORTED'
 const requiresDistributionBeforeAnnotation = computed(() => isAdminImportedReport(currentReport.value))
 const isViewOnlyAccessibleReport = computed(() => {
   if (props.isAdminMode) return false
   if (currentUser.value?.role !== 'doctor') return false
   if (!currentUser.value?.can_view_all) return false
-  return currentReport.value?.assigned_doctor_id !== currentUser.value.id
+  return !isCurrentUserTaskOwner(currentReport.value)
 })
 
 const getDisplayStatus = (reportLike) => {
-  return resolveBaseStatus(reportLike)
+  const baseStatus = resolveBaseStatus(reportLike)
+  if (props.isAdminMode) return baseStatus
+  if (
+    isReviewTask(reportLike) &&
+    isCurrentUserAnnotator(reportLike) &&
+    !isCurrentUserReviewOwner(reportLike)
+  ) {
+    return 'SUBMITTED'
+  }
+  return baseStatus
 }
 
 const isAnnotatedDisplayStatus = (reportLike) => {
-  if (isReviewTask(reportLike)) return false
+  if (!isInAnnotationTaskPool(reportLike)) return false
+  if (props.isAdminMode) {
+    return (
+      ['SUBMITTED', 'REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS', 'DONE'].includes(resolveBaseStatus(reportLike)) ||
+      getAnnotationStatus(reportLike) === 'SUBMITTED'
+    )
+  }
   const displayStatus = getDisplayStatus(reportLike)
   return displayStatus === 'SUBMITTED' || displayStatus === 'DONE'
 }
 
 const isUnannotatedDisplayStatus = (reportLike) => {
+  if (!isInAnnotationTaskPool(reportLike)) return false
   if (isReviewTask(reportLike)) return false
   return ['IMPORTED', 'ASSIGNED', 'IN_PROGRESS'].includes(getDisplayStatus(reportLike))
 }
 
 const isPendingReviewDisplayStatus = (reportLike) => {
-  return ['REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS'].includes(getDisplayStatus(reportLike))
+  if (!['REVIEW_ASSIGNED', 'REVIEW_IN_PROGRESS'].includes(getDisplayStatus(reportLike))) return false
+  if (props.isAdminMode) return true
+  return isAssignedReviewer(reportLike)
 }
 
 const isReviewedDisplayStatus = (reportLike) => {
   if (!isReviewTask(reportLike)) return false
   if (getDisplayStatus(reportLike) !== 'DONE') return false
   if (props.isAdminMode) return true
-  if (onlyMine.value) return true
   return hasCurrentUserCompletedReview(reportLike) || isAssignedReviewer(reportLike)
 }
 
@@ -584,17 +637,14 @@ const resolveBestAvailableFilter = (items) => {
 }
 
 const buildAnnotationProgress = (items) => {
-  const annotationItems = items.filter((item) => !isReviewTask(item))
+  const annotationItems = items.filter((item) => isInAnnotationTaskPool(item))
   const total = annotationItems.length
-  const done = items.filter((item) => (
-    isAnnotatedDisplayStatus(item) ||
-    (!isReviewTask(item) && getAnnotationStatus(item) === 'SUBMITTED')
-  )).length
+  const done = annotationItems.filter((item) => isAnnotatedDisplayStatus(item)).length
   return { done, total }
 }
 
 const buildReviewProgress = (items) => {
-  const reviewItems = items.filter((item) => isReviewTask(item))
+  const reviewItems = items.filter((item) => isInReviewTaskPool(item))
   const done = reviewItems.filter((item) => (
     getDisplayStatus(item) === 'DONE' || getReviewCompletedUserIds(item).length > 0
   )).length
@@ -602,14 +652,12 @@ const buildReviewProgress = (items) => {
 }
 
 const buildOverallProgress = (items) => {
-  const total = items.length
-  const done = items.filter((item) => {
-    if (isReviewTask(item)) {
-      return isReviewedDisplayStatus(item)
-    }
-    return isAnnotatedDisplayStatus(item) || getAnnotationStatus(item) === 'SUBMITTED'
-  }).length
-  return { done, total }
+  const annotationProgressValue = buildAnnotationProgress(items)
+  const reviewProgressValue = buildReviewProgress(items)
+  return {
+    done: annotationProgressValue.done + reviewProgressValue.done,
+    total: annotationProgressValue.total + reviewProgressValue.total
+  }
 }
 
 const syncCurrentReportSummaryFromRow = (row) => {
@@ -682,21 +730,37 @@ const canSubmitCurrentReport = computed(() => {
   if (isCollaborationEditingLocked.value) return false
   return canSubmitStatus(currentDisplayStatus.value)
 })
+const isAnnotatedTabReviewLocked = computed(() => {
+  if (!currentReport.value) return false
+  if (activeFilter.value !== 'annotated') return false
+  if (!isReviewTask(currentReport.value)) return false
+  return !isCurrentUserReviewOwner(currentReport.value)
+})
+const isCancelAnnotationBlockedByReview = computed(() => {
+  if (!currentReport.value) return false
+  if (!isReviewTask(currentReport.value)) return false
+  return isAnnotatedTabReviewLocked.value || !isCurrentUserReviewOwner(currentReport.value)
+})
 const showCancelAnnotationButton = computed(() => {
   if (!currentReport.value) return false
   if (isViewOnlyAccessibleReport.value) return false
   if (requiresDistributionBeforeAnnotation.value) return false
+  if (isCancelAnnotationBlockedByReview.value) return true
   const status = currentDisplayStatus.value
-  if (isReviewTask(currentReport.value)) {
-    return status === 'DONE'
-  }
+  if (isReviewTask(currentReport.value)) return status === 'DONE'
   const annotationStatus = getAnnotationStatus(currentReport.value)
   if (annotationStatus === 'SUBMITTED') return true
   return ['SUBMITTED', 'DONE'].includes(status)
 })
+const isCancelAnnotationActionDisabled = computed(() => isCollaborationEditingLocked.value)
 const cancelAnnotationButtonText = computed(() => {
-  if (isReviewTask(currentReport.value) && currentDisplayStatus.value === 'DONE') {
-    return '撤销复核'
+  if (isCancelAnnotationBlockedByReview.value) return '取消标注'
+  if (
+    ['review', 'reviewed'].includes(activeFilter.value) &&
+    isReviewTask(currentReport.value) &&
+    currentDisplayStatus.value === 'DONE'
+  ) {
+    return '取消复核'
   }
   return '取消标注'
 })
@@ -2108,6 +2172,12 @@ const extractReplacementFromSuggestion = (message) => {
   return ''
 }
 
+const getCardReplacementText = (card) => {
+  const targetText = normalizeInputText(card?.target)
+  if (targetText) return targetText
+  return extractReplacementFromSuggestion(card?.alert_message)
+}
+
 const inferProcessMethodFromImportedData = (card) => {
   const message = normalizeInputText(card.alert_message)
   const defaultMethod = getDefaultProcessMethodByErrorType(card.error_type)
@@ -2439,16 +2509,19 @@ const resolveRange = (text, card) => {
   const source = card.source || ''
   const parsedStart = Number.parseInt(card.source_in_start, 10)
   const parsedEnd = Number.parseInt(card.source_in_end, 10)
+  const hasExplicitStart = Number.isInteger(parsedStart)
+  const hasExplicitEnd = Number.isInteger(parsedEnd)
+  const hasExplicitRange = hasExplicitStart || hasExplicitEnd
 
-  if ((Number.isInteger(parsedStart) && parsedStart < 0) || (Number.isInteger(parsedEnd) && parsedEnd < 0)) {
+  if ((hasExplicitStart && parsedStart < 0) || (hasExplicitEnd && parsedEnd < 0)) {
     return { start: 0, end: 0, missing: true }
   }
 
   const candidates = []
-  if (Number.isInteger(parsedStart) && Number.isInteger(parsedEnd)) {
+  if (hasExplicitStart && hasExplicitEnd) {
     candidates.push([parsedStart, parsedEnd], [parsedStart - 1, parsedEnd - 1])
   }
-  if (Number.isInteger(parsedStart) && source) {
+  if (hasExplicitStart && source) {
     candidates.push([parsedStart, parsedStart + source.length], [parsedStart - 1, parsedStart - 1 + source.length])
   }
 
@@ -2458,6 +2531,10 @@ const resolveRange = (text, card) => {
     if (!source || text.slice(start, end) === source) {
       return { start, end, missing: false }
     }
+  }
+
+  if (hasExplicitRange) {
+    return null
   }
 
   if (source) {
@@ -2632,7 +2709,14 @@ const getHighlightedHtml = (field) => {
     const collaborationStatus = collaborationCard
       ? `<span class="hl-collab-status">${collaborationCard.activity_status === 'selecting' ? '对方已选中' : '对方标注中'}</span>`
       : ''
-    const replacement = `<span class="${baseClass} ${actionClass}" data-card-id="${primaryCard.id}"${tooltipAttr}>${escapeHtml(sourceText)}${promptIcon}${badge}${collaborationStatus}</span>`
+    const replacementText = action === 'replace' ? getCardReplacementText(primaryCard) : ''
+    const sourceHtml = action === 'replace'
+      ? `<span class="hl-source-strike">${escapeHtml(sourceText)}</span>`
+      : escapeHtml(sourceText)
+    const replaceSuffix = action === 'replace' && replacementText
+      ? `<span class="hl-replace-target">[${escapeHtml(replacementText)}]</span>`
+      : ''
+    const replacement = `<span class="${baseClass} ${actionClass}" data-card-id="${primaryCard.id}"${tooltipAttr}>${sourceHtml}${replaceSuffix}${promptIcon}${badge}${collaborationStatus}</span>`
     parts.push(replacement)
     cursor = safeEnd
   }
@@ -2786,8 +2870,6 @@ const loadReports = async (options = {}) => {
   allReportList.value = res.items || []
 
   syncReportCollectionsFromAllReports()
-  annotationProgress.value = res.annotation_progress || annotationProgress.value
-  reviewProgress.value = res.review_progress || reviewProgress.value
 
   if (silent) {
     const currentRow = currentReport.value
@@ -3052,12 +3134,23 @@ const editCard = async (card) => {
   await publishLocalCollaborationActivity()
 }
 
+const hasValidCardRange = (card) => {
+  const start = Number.parseInt(card?.source_in_start, 10)
+  const end = Number.parseInt(card?.source_in_end, 10)
+  return Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end > start
+}
+
 const prepareCardForSave = async (card, options = {}) => {
   card.target = normalizeInputText(card.target)
   card.process_method = normalizeProcessMethodByErrorType(card.error_type, card.process_method)
   card.manual_override = !!card.manual_override
   card._targetValidationError = ''
   applyDefaultSeverity(card)
+
+  if (card.kind === 'manual' && !hasValidCardRange(card)) {
+    ElMessage.warning('当前标注未获取到稳定文本索引，请重新选择文本后再标注')
+    return false
+  }
 
   if (card.process_method === PROCESS_METHOD.replace && !normalizeInputText(card.target)) {
     card._targetValidationError = '请填写替换内容'
@@ -3181,7 +3274,9 @@ const readCurrentSelectionContext = () => {
       const fragment = offsetRange.cloneContents()
       const container = document.createElement('div')
       container.appendChild(fragment)
-      container.querySelectorAll('.hl-mark, .hl-prompt-icon, .hl-prompt-triangle, .hl-collab-status').forEach((el) => el.remove())
+      container.querySelectorAll(
+        '.hl-badge-stack, .hl-mark, .hl-prompt-icon, .hl-prompt-triangle, .hl-collab-status, .hl-replace-target, .hl-chip.missing'
+      ).forEach((el) => el.remove())
       return container.textContent?.length ?? 0
     } catch (_e) {
       return null
@@ -3271,6 +3366,15 @@ const createManualCardFromSelection = async () => {
   const selectionContext = readCurrentSelectionContext()
   if (!selectionContext) {
     ElMessage.warning('请先在中间报告中选中要标注的文本')
+    return
+  }
+  if (
+    !Number.isInteger(selectionContext.sourceInStart) ||
+    !Number.isInteger(selectionContext.sourceInEnd) ||
+    selectionContext.sourceInStart < 0 ||
+    selectionContext.sourceInEnd <= selectionContext.sourceInStart
+  ) {
+    ElMessage.warning('当前选区未能计算出文本索引，请重新选择纯文本区域后再标注')
     return
   }
   setLocalCollaborationActivity(buildCollaborationActivityFromSelection(selectionContext))
@@ -3511,24 +3615,24 @@ const submitReport = async () => {
 const cancelSubmittedAnnotation = async () => {
   if (!currentReport.value || !showCancelAnnotationButton.value) return
   const reportIsReviewTask = isReviewTask(currentReport.value)
-  const actionText = reportIsReviewTask ? '撤销复核' : '取消标注'
+  const actionText = reportIsReviewTask ? '取消复核' : '取消标注'
   const hasAccess = await ensureEditAccess(actionText)
   if (!hasAccess) return
   const reportId = currentReport.value.id
   const previousFilter = activeFilter.value
   const confirmText = reportIsReviewTask
-    ? '撤销后，当前报告将回到待复核状态，是否继续？'
+    ? '取消后，当前报告将回到待复核状态，是否继续？'
     : '取消后，当前报告将回到待标注状态，是否继续？'
-  const titleText = reportIsReviewTask ? '撤销复核确认' : '取消标注确认'
+  const titleText = reportIsReviewTask ? '取消复核确认' : '取消标注确认'
   const successText = reportIsReviewTask
-    ? '已撤销复核，当前报告已回到待复核状态'
+    ? '已取消复核，当前报告已回到待复核状态'
     : '已取消标注，当前报告已恢复为可编辑状态'
   try {
     await ElMessageBox.confirm(
       confirmText,
       titleText,
       {
-        confirmButtonText: reportIsReviewTask ? '确认撤销' : '确认取消',
+        confirmButtonText: '确认取消',
         cancelButtonText: '返回',
         type: 'warning'
       }
@@ -3560,6 +3664,14 @@ const cancelSubmittedAnnotation = async () => {
   } catch (_e) {
     // ignore
   }
+}
+
+const handleCancelAnnotationAction = async () => {
+  if (isCancelAnnotationBlockedByReview.value) {
+    ElMessage.warning('该报告已被二次分发复核，无法取消标注')
+    return
+  }
+  await cancelSubmittedAnnotation()
 }
 
 const handleOnlyMineChange = async (value) => {
@@ -3956,11 +4068,28 @@ onMounted(async () => {
   border-color: #ef4444;
 }
 
-.section-content :deep(.hl-chip.hl-prompt) {
+.section-content :deep(.hl-chip.hl-replace) {
   background: #fee2e2;
-  color: #b91c1c;
+  color: #991b1b;
   border-color: #ef4444;
   font-weight: 600;
+}
+
+.section-content :deep(.hl-chip.hl-prompt) {
+  background: #dbeafe;
+  color: #1e40af;
+  border-color: #60a5fa;
+  font-weight: 600;
+}
+
+.section-content :deep(.hl-source-strike) {
+  text-decoration: line-through;
+  text-decoration-thickness: 2px;
+}
+
+.section-content :deep(.hl-replace-target) {
+  color: #dc2626;
+  font-weight: 700;
 }
 
 .section-content :deep(.hl-chip.missing) {
@@ -3985,7 +4114,7 @@ onMounted(async () => {
   line-height: 1;
   font-weight: 800;
   color: #fff;
-  background: #dc2626;
+  background: #2563eb;
   clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
 }
 
@@ -4287,6 +4416,15 @@ onMounted(async () => {
   margin-top: 8px;
   display: flex;
   gap: 8px;
+}
+
+.cancel-annotation-btn-blocked {
+  color: #9ca3af !important;
+  border-color: #d1d5db !important;
+  background: #f3f4f6 !important;
+  cursor: not-allowed;
+  box-shadow: none;
+  opacity: 1;
 }
 
 </style>

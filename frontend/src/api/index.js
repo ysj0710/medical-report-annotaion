@@ -110,12 +110,7 @@ export const api = {
     const path = `${API_BASE}/doctor/reports/${reportId}/collaboration/ws?token=${encodedToken}`
     const urls = []
     const hostname = window.location.hostname
-    const port = window.location.port
-    const isBareLocalhost = LOCAL_HOSTS.has(hostname) && (!port || port === '80' || port === '443')
-
-    if (!isBareLocalhost) {
-      pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
-    }
+    pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
 
     const envTarget = buildWebSocketOriginFromTarget(
       import.meta.env.VITE_COLLABORATION_WS_TARGET ||
@@ -128,12 +123,6 @@ export const api = {
     if (LOCAL_HOSTS.has(hostname)) {
       pushUniqueUrl(urls, `${protocol}//127.0.0.1:8088${path}`)
       pushUniqueUrl(urls, `${protocol}//localhost:8088${path}`)
-    } else if (!window.location.port || window.location.port === '80' || window.location.port === '443') {
-      pushUniqueUrl(urls, `${protocol}//${hostname}:8088${path}`)
-    }
-
-    if (isBareLocalhost) {
-      pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
     }
 
     return urls
@@ -150,12 +139,7 @@ export const api = {
     const path = `${API_BASE}/doctor/reports/updates/ws?token=${encodedToken}`
     const urls = []
     const hostname = window.location.hostname
-    const port = window.location.port
-    const isBareLocalhost = LOCAL_HOSTS.has(hostname) && (!port || port === '80' || port === '443')
-
-    if (!isBareLocalhost) {
-      pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
-    }
+    pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
 
     const envTarget = buildWebSocketOriginFromTarget(
       import.meta.env.VITE_COLLABORATION_WS_TARGET ||
@@ -168,12 +152,6 @@ export const api = {
     if (LOCAL_HOSTS.has(hostname)) {
       pushUniqueUrl(urls, `${protocol}//127.0.0.1:8088${path}`)
       pushUniqueUrl(urls, `${protocol}//localhost:8088${path}`)
-    } else if (!window.location.port || window.location.port === '80' || window.location.port === '443') {
-      pushUniqueUrl(urls, `${protocol}//${hostname}:8088${path}`)
-    }
-
-    if (isBareLocalhost) {
-      pushUniqueUrl(urls, `${protocol}//${window.location.host}${path}`)
     }
 
     return urls
