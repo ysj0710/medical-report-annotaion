@@ -105,8 +105,8 @@
           <el-checkbox v-model="autoGoNextAfterSubmit" class="auto-next-toggle">完成之后自动进入下一个</el-checkbox>
           <el-button @click="goPrevReport">上一个</el-button>
           <el-button @click="goNextReport">下一个</el-button>
-          <el-button type="primary" @click="createManualCardFromSelection" :disabled="isEditingLocked">标注选中文本</el-button>
-          <el-button type="success" @click="submitReport" :loading="submitting" :disabled="!canSubmitCurrentReport">{{ submitButtonText }}</el-button>
+          <el-button type="primary" @click="createManualCardFromSelection" :disabled="isEditingLocked">标注选中文本（Q）</el-button>
+          <el-button type="success" @click="submitReport" :loading="submitting" :disabled="!canSubmitCurrentReport">{{ submitButtonText }}（S）</el-button>
           <el-button
             v-if="showCancelAnnotationButton"
             type="danger"
@@ -115,8 +115,11 @@
             :disabled="isCancelAnnotationActionDisabled"
             :class="{ 'cancel-annotation-btn-blocked': isCancelAnnotationBlockedByReview }"
           >
-            {{ cancelAnnotationButtonText }}
+            {{ cancelAnnotationButtonText }}（D）
           </el-button>
+          <div class="action-shortcut-hint">
+            快捷键：Q 标注选中文本，S {{ submitButtonText }}<template v-if="showCancelAnnotationButton">，D {{ cancelAnnotationButtonText }}</template>
+          </div>
         </div>
       </div>
 
@@ -3412,6 +3415,46 @@ const createManualCardFromSelection = async () => {
   scrollToCard(newCard.id)
 }
 
+const isShortcutInputTarget = (target) => {
+  if (!(target instanceof HTMLElement)) return false
+  const tagName = String(target.tagName || '').toLowerCase()
+  const inWorkbenchDialog = !!target.closest('.workbench-dialog')
+  if (target.isContentEditable) return true
+  if (['input', 'textarea', 'select'].includes(tagName)) return true
+  if (target.closest('[contenteditable="true"]')) return true
+  if (target.closest('.el-message-box')) return true
+  if (!inWorkbenchDialog && target.closest('.el-dialog, .el-drawer')) return true
+  return false
+}
+
+const handleDocumentKeydown = (event) => {
+  if (event.defaultPrevented || event.isComposing || event.repeat) return
+  if (event.ctrlKey || event.metaKey || event.altKey) return
+  const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  const eventTarget = event.target instanceof HTMLElement ? event.target : null
+  if (isShortcutInputTarget(activeElement || eventTarget)) return
+
+  const key = String(event.key || '').trim().toLowerCase()
+  const code = String(event.code || '').trim()
+  if (key === 'q' || code === 'KeyQ') {
+    if (isEditingLocked.value) return
+    event.preventDefault()
+    void createManualCardFromSelection()
+    return
+  }
+  if (key === 's' || code === 'KeyS') {
+    if (!canSubmitCurrentReport.value || submitting.value) return
+    event.preventDefault()
+    void submitReport()
+    return
+  }
+  if (key === 'd' || code === 'KeyD') {
+    if (!showCancelAnnotationButton.value || isCancelAnnotationActionDisabled.value) return
+    event.preventDefault()
+    void handleCancelAnnotationAction()
+  }
+}
+
 const remindUnsubmitted = async (offset = 1) => {
   if (!currentReport.value || !isDraftWorkflowStatus(currentDisplayStatus.value)) return 'pass'
   const directionText = offset < 0 ? '上一份' : '下一份'
@@ -3703,6 +3746,7 @@ onBeforeUnmount(() => {
   stopReportUpdatesSocket()
   if (typeof window !== 'undefined') {
     window.removeEventListener('resize', handleWindowResize)
+    window.removeEventListener('keydown', handleDocumentKeydown, true)
   }
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleDocumentVisibilityChange)
@@ -3719,6 +3763,7 @@ onMounted(async () => {
     restoreDismissedPreCardKeys()
     if (typeof window !== 'undefined') {
       window.addEventListener('resize', handleWindowResize)
+      window.addEventListener('keydown', handleDocumentKeydown, true)
     }
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleDocumentVisibilityChange)
@@ -3846,6 +3891,13 @@ onMounted(async () => {
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.action-shortcut-hint {
+  width: 100%;
+  text-align: right;
+  font-size: 12px;
+  color: #6b7280;
 }
 
 .auto-next-toggle {
